@@ -1,0 +1,646 @@
+From d24fabe7006b27bbe430f9c91a96c82866360c17 Mon Sep 17 00:00:00 2001
+From: aignis <6974796+aignis@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 10:19:40 +0100
+Subject: [PATCH 3/5] ctr-web data and defaults: PAL VRAM layout, boot to menu,
+ widescreen, XA voice language, unlock all, ctr-native.ini
+
+Brings ctr-web's changes to the ctrpad base, behind options that keep the
+retail behaviour by default:
+- CTR_SWAPCHAIN_Y (0x128; 0xEC for data converted from the PAL disc)
+- CTR_SKIP_INTRO (boot straight into the main menu)
+- g_cfg_widescreen (16:9 projection squeeze and culling, 16:9 presentation)
+- XA voice language for XNF and voice folders, with ENG fallback
+- g_cfg_unlockAll in the main menu
+- XA music and TEST.STR optional for ctr-web data
+Switch 2 enables them through CTR_SWITCH2_CTR_WEB_ASSETS/SKIP_INTRO and reads
+widescreen, internal_scale, bilinear, voices and unlock_all from ctr-native.ini.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                    |  13 +++
+ game/230/MM_MenuFlow.c            |  16 ++++
+ game/CAM.c                        |   2 +-
+ game/ElimBG.c                     |   2 +-
+ game/LOAD/LOAD_TenStages.c        |   2 +
+ game/MAIN/MainFrame_RenderFrame.c |   2 +-
+ game/MAIN/MainInit.c              |   2 +-
+ game/MAIN/MainMain.c              |  17 +++-
+ game/PushBuffer.c                 |  19 +++++
+ include/macros.h                  |  13 +++
+ include/platform.h                |   6 ++
+ include/platform/native_assets.h  |   4 +
+ main.c                            | 128 +++++++++++++++++++++++++++++-
+ platform/native_assets.c          |  75 ++++++++++++++++-
+ platform/native_audio.c           |   8 +-
+ platform/native_platform.c        |   2 +
+ platform/native_renderer.c        |   2 +
+ 17 files changed, 299 insertions(+), 14 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 17ad7ffd..b2d5cb9a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -295,6 +295,19 @@ if(CTR_NATIVE_SWITCH2)
+     # (MIPS, x86 and Apple arm64 all default to it; AArch64 ELF does not).
+     set_target_properties(ctr_native PROPERTIES C_EXTENSIONS ON OUTPUT_NAME "ctr-native")
+     target_compile_options(ctr_native PRIVATE -fsigned-char)
++    option(CTR_SWITCH2_CTR_WEB_ASSETS
++        "Game data converted by ctr-web from the PAL disc (PAL VRAM layout, no XA music or TEST.STR)" ON)
++    option(CTR_SWITCH2_SKIP_INTRO "Boot straight into the main menu" ON)
++    if(CTR_SWITCH2_CTR_WEB_ASSETS)
++        target_compile_definitions(ctr_native PRIVATE
++            CTR_SWAPCHAIN_Y=0xEC
++            CTR_NATIVE_XA_MUSIC_OPTIONAL=1
++            CTR_NATIVE_TEST_STR_OPTIONAL=1
++        )
++    endif()
++    if(CTR_SWITCH2_SKIP_INTRO)
++        target_compile_definitions(ctr_native PRIVATE CTR_SKIP_INTRO=1)
++    endif()
+     # main() lives here (not in the library) so the linker always takes it.
+     target_sources(ctr_native PRIVATE platform/switch2/switch2_main.c)
+     set(CTR_SWITCH2_NRO_NAME "CTR Native" CACHE STRING "Title shown in hbmenu")
+diff --git a/game/230/MM_MenuFlow.c b/game/230/MM_MenuFlow.c
+index ddc3e052..ee3a06f3 100644
+--- a/game/230/MM_MenuFlow.c
++++ b/game/230/MM_MenuFlow.c
+@@ -53,6 +53,22 @@ void MM_MenuProc_Main(struct RectMenu *mainMenu)
+ 		mainMenu->rows = &D230.rowsMainMenuWithScrapbook[0];
+ 	}
+ 
++#if defined(CTR_NATIVE)
++	if (g_cfg_unlockAll)
++	{
++		sdata->gameProgress.unlocks[0] |= UNLOCK_CHARACTERS | GAME_UNLOCK_TRACKS_MASK;
++		UNLOCK_ADV_BIT(sdata->gameProgress.unlocks, GAME_UNLOCK_BIT_SCRAPBOOK);
++		for (int d = 0; d < MM_DIFFICULTY_COUNT; d++)
++		{
++			const int first = D230.cupDifficulty.firstUnlockBit[d];
++			for (int t = 0; (first >= 0) && (t < MM_CUP_TRACK_COUNT); t++)
++			{
++				UNLOCK_ADV_BIT(sdata->gameProgress.unlocks, first + t);
++			}
++		}
++	}
++#endif
++
+ 	MM_ParseCheatCodes();
+ 	MM_ToggleRows_Difficulty();
+ 	MM_ToggleRows_PlayerCount();
+diff --git a/game/CAM.c b/game/CAM.c
+index ce74b347..cfd3c7e8 100644
+--- a/game/CAM.c
++++ b/game/CAM.c
+@@ -312,7 +312,7 @@ void CAM_ClearScreen(struct GameTracker *gGT)
+ 		uint32_t *endOT = &pb->ptrOT[0x3FF];
+ 
+ 		s16 x = pb->rect.x;
+-		s16 y = pb->rect.y + swap * 0x128;
++		s16 y = pb->rect.y + swap * CTR_SWAPCHAIN_Y;
+ 		s16 w = pb->rect.w;
+ 		s16 h = pb->rect.h;
+ 
+diff --git a/game/ElimBG.c b/game/ElimBG.c
+index 8904c449..0d450264 100644
+--- a/game/ElimBG.c
++++ b/game/ElimBG.c
+@@ -29,7 +29,7 @@ enum ElimBGConstants
+ 	ELIM_BG_TEXTURE_BACKUP_OFFSET = 0x4800,
+ 	ELIM_BG_SCREEN_W = 0x200,
+ 	ELIM_BG_SCREEN_H = 0xd8,
+-	ELIM_BG_SWAPCHAIN_Y_STRIDE = 0x128,
++	ELIM_BG_SWAPCHAIN_Y_STRIDE = CTR_SWAPCHAIN_Y,
+ 	ELIM_BG_STRIP_H = 8,
+ 	ELIM_BG_CAPTURE_VRAM_X = 0x200,
+ 	ELIM_BG_CAPTURE_VRAM_W = 0x80,
+diff --git a/game/LOAD/LOAD_TenStages.c b/game/LOAD/LOAD_TenStages.c
+index 19d542a6..2d27389c 100644
+--- a/game/LOAD/LOAD_TenStages.c
++++ b/game/LOAD/LOAD_TenStages.c
+@@ -64,6 +64,7 @@ int LOAD_TenStages(struct GameTracker *gGT, int loadingStage, struct BigHeader *
+ 
+ 			sdata->boolFirstBoot = 0;
+ 
++#if !CTR_SKIP_INTRO
+ 			// Load Intro TIM for Copyright Page from VRAM file
+ 			LOAD_VramFile(bigfile, LOAD_FIRST_BOOT_COPYRIGHT_TIM_BIGFILE_INDEX, NULL, &vramSize, -1);
+ 			MainInit_VRAMDisplay();
+@@ -80,6 +81,7 @@ int LOAD_TenStages(struct GameTracker *gGT, int loadingStage, struct BigHeader *
+ 				Platform_PresentVRAMDisplay();
+ 			}
+ #endif
++#endif // !CTR_SKIP_INTRO
+ 
+ 			gGT->db[0].drawEnv.isbg = 0;
+ 			gGT->db[1].drawEnv.isbg = 0;
+diff --git a/game/MAIN/MainFrame_RenderFrame.c b/game/MAIN/MainFrame_RenderFrame.c
+index 2e561d45..5a230327 100644
+--- a/game/MAIN/MainFrame_RenderFrame.c
++++ b/game/MAIN/MainFrame_RenderFrame.c
+@@ -845,7 +845,7 @@ void RenderAllHeatParticles(struct GameTracker *gGT)
+ 		return;
+ 	}
+ 
+-	Torch_Main(gGT->particleList_heatWarp, &gGT->pushBuffer[0], &gGT->backBuffer->primMem, gGT->numPlyrCurrGame, gGT->swapchainIndex * 0x128);
++	Torch_Main(gGT->particleList_heatWarp, &gGT->pushBuffer[0], &gGT->backBuffer->primMem, gGT->numPlyrCurrGame, gGT->swapchainIndex * CTR_SWAPCHAIN_Y);
+ }
+ 
+ static s32 RenderAllLevelGeometry_ScaleDistanceShift8(s32 distToScreen, s32 scale)
+diff --git a/game/MAIN/MainInit.c b/game/MAIN/MainInit.c
+index af2fc684..026e8f13 100644
+--- a/game/MAIN/MainInit.c
++++ b/game/MAIN/MainInit.c
+@@ -932,7 +932,7 @@ void MainInit_VRAMDisplay()
+ 	x[1] = 0x100;
+ 
+ 	y[0] = 0;
+-	y[1] = 0x128;
++	y[1] = CTR_SWAPCHAIN_Y;
+ 
+ 	for (int i = 0; i < 2; i++)
+ 	{
+diff --git a/game/MAIN/MainMain.c b/game/MAIN/MainMain.c
+index d47e7441..d3410818 100644
+--- a/game/MAIN/MainMain.c
++++ b/game/MAIN/MainMain.c
+@@ -561,8 +561,8 @@ void StateZero()
+ 	SetDispMask(1);
+ 
+ 	SetDefDrawEnv(&gGT->db[0].drawEnv, 0, 0, 0x200, 0xd8);
+-	SetDefDrawEnv(&gGT->db[1].drawEnv, 0, 0x128, 0x200, 0xd8);
+-	SetDefDispEnv(&gGT->db[0].dispEnv, 0, 0x128, 0x200, 0xd8);
++	SetDefDrawEnv(&gGT->db[1].drawEnv, 0, CTR_SWAPCHAIN_Y, 0x200, 0xd8);
++	SetDefDispEnv(&gGT->db[0].dispEnv, 0, CTR_SWAPCHAIN_Y, 0x200, 0xd8);
+ 	SetDefDispEnv(&gGT->db[1].dispEnv, 0, 0, 0x200, 0xd8);
+ 
+ 	gGT->db[0].dispEnv.screen.x = 0;
+@@ -648,8 +648,14 @@ void StateZero()
+ 	GAMEPROG_NewGame_OnBoot();
+ 	gGT->overlayIndex_null_notUsed = 0;
+ 
++#if CTR_SKIP_INTRO
++	// boot straight into the main menu (what START on the Naughty Dog crate does)
++	gGT->levelID = MAIN_MENU_LEVEL;
++	strcpy(gGT->levelName, data.metaDataLEV[MAIN_MENU_LEVEL].name_Debug);
++#else
+ 	gGT->levelID = NAUGHTY_DOG_CRATE;
+ 	memcpy(gGT->levelName, sdata->s_ndi, sizeof(sdata->s_ndi));
++#endif
+ 	// gGT->levelID = OXIDE_TRUE_ENDING;
+ 
+ 	InitGeom();
+@@ -673,9 +679,11 @@ void StateZero()
+ 	PutDrawEnv(&gGT->db[1].drawEnv);
+ 	DrawSync(0);
+ 
++#if !CTR_SKIP_INTRO
+ 	// Load Intro TIM for "SCEA Presents" from VRAM file
+ 	LOAD_VramFile(sdata->ptrBigfile1, 0x1fd, NULL, &vramSize, -1);
+ 	MainInit_VRAMDisplay();
++#endif
+ 
+ 	// \SOUNDS\KART.HWL;1
+ 	// NOTE(aalhendi): ASM-verified NTSC-U 926 0x8003c8e0-0x8003c928 for startup HOWL/music/XA setup.
+@@ -688,8 +696,13 @@ void StateZero()
+ 	CseqMusic_Start(CSEQ_SONG_LEVEL, 0, NULL, 0, 0);
+ 	Music_Start(0);
+ 
++#if CTR_SKIP_INTRO
++	// same as the START skip on the Naughty Dog crate: intro song off
++	CseqMusic_StopAll();
++#else
+ 	// "Start your engines, for Sony Computer..."
+ 	CDSYS_XAPlay(CDSYS_XA_TYPE_EXTRA, 0x50);
++#endif
+ 
+ 	while (sdata->XA_State != 0)
+ 	{
+diff --git a/game/PushBuffer.c b/game/PushBuffer.c
+index 7e666f93..544701fe 100644
+--- a/game/PushBuffer.c
++++ b/game/PushBuffer.c
+@@ -423,6 +423,18 @@ void PushBuffer_SetMatrixVP(struct PushBuffer *pb)
+ 	// scale Y axis (3)
+ 	pb->matrix_ViewProj.m[1][2] = pb->matrix_ViewProj.m[1][2] * r360 / r600;
+ 
++#if defined(CTR_NATIVE)
++	// Widescreen (ctr-web): squeeze X by 3/4 so the 4:3 frame shown at 16:9
++	// keeps correct proportions and reveals more horizontal field of view.
++	if (g_cfg_widescreen)
++	{
++		pb->matrix_ViewProj.t[0] = pb->matrix_ViewProj.t[0] * 3 / 4;
++		pb->matrix_ViewProj.m[0][0] = pb->matrix_ViewProj.m[0][0] * 3 / 4;
++		pb->matrix_ViewProj.m[0][1] = pb->matrix_ViewProj.m[0][1] * 3 / 4;
++		pb->matrix_ViewProj.m[0][2] = pb->matrix_ViewProj.m[0][2] * 3 / 4;
++	}
++#endif
++
+ 	// store camera matrix,
+ 	// otherwise oxide intro cutscene bugs out,
+ 	// when crash is sleeping on the grassy hill
+@@ -609,6 +621,13 @@ void PushBuffer_UpdateFrustum(struct PushBuffer *pb)
+ 
+ 	val_X = pb->rect.w;
+ 	val_X = val_X / 2;
++#if defined(CTR_NATIVE)
++	if (g_cfg_widescreen)
++	{
++		// widen the culling frustum to match the widescreen projection
++		val_X = (val_X * 4) / 3;
++	}
++#endif
+ 
+ 	val_Y = ((pb->rect.h * 0x600) / 0x360);
+ 	val_Y = val_Y / 2;
+diff --git a/include/macros.h b/include/macros.h
+index 2574d0f4..cbb8d4d1 100644
+--- a/include/macros.h
++++ b/include/macros.h
+@@ -130,4 +130,17 @@ force_inline void CTR_WriteU32LE(void *dst, u32 value)
+ 
+ #define aspectratiodownsample(int) (int * 4) / 7
+ 
++// VRAM Y of the second swapchain buffer. NTSC-U retail uses 0x128 (296..511).
++// Data converted from the PAL disc (ctr-web's pal2usa_bigfile.py) keeps font
++// CLUTs at y>=472, so it needs the PAL layout: buffers at y=0 and y=0xEC.
++#ifndef CTR_SWAPCHAIN_Y
++#define CTR_SWAPCHAIN_Y 0x128
++#endif
++
++// 1 = boot straight into the main menu (as pressing START on the Naughty Dog
++// crate does), skipping SCEA, copyright and the intro cutscenes.
++#ifndef CTR_SKIP_INTRO
++#define CTR_SKIP_INTRO 0
++#endif
++
+ #endif
+diff --git a/include/platform.h b/include/platform.h
+index 527bf156..efa1fc92 100644
+--- a/include/platform.h
++++ b/include/platform.h
+@@ -40,4 +40,10 @@ int Platform_RunFrameStatsSelfTest(void);
+ int NikoGetEnterKey(void);
+ #endif
+ 
++// 1 = 16:9 presentation with a widened 3D field of view (ctr-web widescreen).
++extern int g_cfg_widescreen;
++// 1 = everything unlocked while in the main menu (characters, tracks,
++// scrapbook, Medium/Hard), as ctr-web's "desbloquear todo".
++extern int g_cfg_unlockAll;
++
+ #endif
+diff --git a/include/platform/native_assets.h b/include/platform/native_assets.h
+index 86e43bb8..70393c3e 100644
+--- a/include/platform/native_assets.h
++++ b/include/platform/native_assets.h
+@@ -33,5 +33,9 @@ FILE *NativeAssets_OpenHostBigfile(const char *mode);
+ int NativeAssets_ReadBytes(const char *path, int readMode, struct NativeAssetsByteBuffer *bytes);
+ void NativeAssets_FreeBytes(struct NativeAssetsByteBuffer *bytes);
+ int NativeAssets_Validate(void);
++// "ENG" (default), "SPN", "FRN", "GRM", "ITL" or "DCH"; returns 0 if unknown.
++int NativeAssets_SetXAVoiceLanguage(const char *language);
++const char *NativeAssets_GetXAVoiceLanguage(void);
++const char *NativeAssets_GetXAVoiceXNFPath(void);
+ 
+ #endif
+diff --git a/main.c b/main.c
+index 9225fbd5..f405e54b 100644
+--- a/main.c
++++ b/main.c
+@@ -369,6 +369,120 @@ struct NativeLaunchOptions
+ 
+ // Returns 1 when a complete NTSC-U asset source is selected, 0 when the
+ // selected source is missing or invalid, and -1 for a storage/path failure.
++#if defined(CTR_NATIVE_SWITCH2)
++// ctr-native.ini next to the NRO: key=value lines, written with the defaults
++// on first start. Unknown keys are ignored.
++global_variable int s_switch2InternalScale = 3;
++
++static void Switch2Config_Set(const char *key, const char *value)
++{
++	const int number = atoi(value);
++	if (strcmp(key, "widescreen") == 0)
++	{
++		g_cfg_widescreen = number != 0;
++	}
++	else if (strcmp(key, "internal_scale") == 0)
++	{
++		s_switch2InternalScale = (number < 1) ? 1 : ((number > 4) ? 4 : number);
++	}
++	else if (strcmp(key, "bilinear") == 0)
++	{
++		g_cfg_bilinearFiltering = number != 0;
++	}
++	else if (strcmp(key, "voices") == 0)
++	{
++		if (!NativeAssets_SetXAVoiceLanguage(value))
++		{
++			fprintf(stderr, "[Switch2] unknown voices=%s (ENG, SPN, FRN, GRM, ITL, DCH)\n", value);
++		}
++	}
++	else if (strcmp(key, "unlock_all") == 0)
++	{
++		g_cfg_unlockAll = number != 0;
++	}
++}
++
++static void Switch2Config_Load(const char *basePath)
++{
++	char path[1024];
++	char line[256];
++	FILE *file;
++
++	// Defaults: what ctr-web plays with (PAL data in Spanish, 16:9).
++	g_cfg_widescreen = 1;
++	g_cfg_unlockAll = 0;
++	NativeAssets_SetXAVoiceLanguage("SPN");
++
++	snprintf(path, sizeof(path), "%sctr-native.ini", basePath ? basePath : "");
++	file = fopen(path, "r");
++	if (file == NULL)
++	{
++		file = fopen(path, "w");
++		if (file != NULL)
++		{
++			fputs("# CTR Native para Switch 2. Cambia los valores y vuelve a abrir el juego.\n"
++			      "# widescreen: 1 = 16:9, 0 = 4:3\n"
++			      "widescreen=1\n"
++			      "# internal_scale: resolucion interna 1-4 (x 240 lineas)\n"
++			      "internal_scale=3\n"
++			      "# bilinear: 1 = texturas filtradas\n"
++			      "bilinear=0\n"
++			      "# voices: carpeta de voces XA (ENG, SPN, FRN, GRM, ITL, DCH)\n"
++			      "voices=SPN\n"
++			      "# unlock_all: 1 = todo desbloqueado en el menu\n"
++			      "unlock_all=0\n",
++			      file);
++			fclose(file);
++		}
++		printf("[Switch2] wrote default %s\n", path);
++		return;
++	}
++	while (fgets(line, sizeof(line), file) != NULL)
++	{
++		char *eq;
++		char *end;
++		char *key = line;
++		while ((*key == ' ') || (*key == '\t'))
++		{
++			key++;
++		}
++		if ((*key == '#') || (*key == ';') || (*key == '\0'))
++		{
++			continue;
++		}
++		eq = strchr(key, '=');
++		if (eq == NULL)
++		{
++			continue;
++		}
++		*eq = '\0';
++		for (end = eq - 1; (end >= key) && ((*end == ' ') || (*end == '\t')); end--)
++		{
++			*end = '\0';
++		}
++		eq++;
++		while ((*eq == ' ') || (*eq == '\t'))
++		{
++			eq++;
++		}
++		for (end = eq + strlen(eq) - 1; (end >= eq) && ((*end == '\n') || (*end == '\r') || (*end == ' ') || (*end == '\t')); end--)
++		{
++			*end = '\0';
++		}
++		Switch2Config_Set(key, eq);
++	}
++	fclose(file);
++	printf("[Switch2] config %s: widescreen=%d internal_scale=%d bilinear=%d voices=%s unlock_all=%d\n", path, g_cfg_widescreen,
++	       s_switch2InternalScale, g_cfg_bilinearFiltering, NativeAssets_GetXAVoiceLanguage(), g_cfg_unlockAll);
++}
++
++static void Switch2Config_ApplyRenderer(void)
++{
++	const int applied = NativeRenderer_SetInternalResolutionScale(s_switch2InternalScale);
++	Platform_Log("[Switch2] internal_scale requested=%d applied=%d widescreen=%d\n", s_switch2InternalScale, applied, g_cfg_widescreen);
++}
++#endif
++
+ static int NativeApp_SelectAndValidateAssets(const char *sdlBasePath)
+ {
+ 	if (!NativeAssets_InitWithDiscImage(sdlBasePath, NativeStorage_GetImportBaseDir(), NULL))
+@@ -451,7 +565,16 @@ static int NativeApp_StartRuntime(const struct NativeLaunchOptions *options)
+ 	}
+ #endif
+ 
+-#ifdef USE_16BY9
++#if defined(CTR_NATIVE_SWITCH2)
++	// The first two arguments only set the presentation aspect; the window is
++	// the console's 1920x1080 surface.
++	printf("[CTR Native] %s\n", g_cfg_widescreen ? "Widescreen" : "4:3");
++	Platform_Init("Crash Team Racing", g_cfg_widescreen ? 1280 : 800, g_cfg_widescreen ? 720 : 600);
++	if (Platform_IsInitialized())
++	{
++		Switch2Config_ApplyRenderer();
++	}
++#elif defined(USE_16BY9)
+ 	printf("[CTR Native] Widescreen\n");
+ 	Platform_Init("Crash Team Racing", 1280, 720);
+ #else
+@@ -794,6 +917,9 @@ int main(int argc, char *argv[])
+ 
+ 	printf("[CTR Native] SDL base path: %s\n", sdlBasePath ? sdlBasePath : "(null)");
+ 	fflush(stdout);
++#if defined(CTR_NATIVE_SWITCH2)
++	Switch2Config_Load(sdlBasePath);
++#endif
+ 	if (!NativeStorage_Init(sdlBasePath))
+ 	{
+ 		fprintf(stderr, "[CTR Native] Failed to initialize storage paths.\n");
+diff --git a/platform/native_assets.c b/platform/native_assets.c
+index a357505d..bd88fd8c 100644
+--- a/platform/native_assets.c
++++ b/platform/native_assets.c
+@@ -20,7 +20,9 @@
+ #define NATIVE_ASSETS_BIGFILE_PATH               "BIGFILE.BIG"
+ #define NATIVE_ASSETS_KART_HWL_PATH              "SOUNDS/KART.HWL"
+ #define NATIVE_ASSETS_TEST_STR_PATH              "TEST.STR"
+-#define NATIVE_ASSETS_XNF_PATH                   "XA/ENG.XNF"
++// XA voices: XA/<LANG>.XNF and XA/<LANG>/{EXTRA,GAME}. NTSC-U discs carry ENG;
++// data converted from a PAL disc may carry another language (ctr-web: SPN).
++#define NATIVE_ASSETS_XNF_PATH                   NativeAssets_GetXAVoiceXNFPath()
+ #define NATIVE_ASSETS_DISC_PATH                  "ctr-u.bin"
+ 
+ #define NATIVE_ASSETS_XA_TYPE_COUNT              3
+@@ -32,6 +34,34 @@
+ #define NATIVE_ASSETS_XA_ENTRY_BYTES             4
+ #define NATIVE_ASSETS_XA_MAX_FILE_NUMBER         256
+ 
++global_variable const char *const s_nativeAssetsXALanguages[] = {"ENG", "SPN", "FRN", "GRM", "ITL", "DCH"};
++global_variable int s_nativeAssetsXALanguage;
++global_variable char s_nativeAssetsXNFPath[32] = "XA/ENG.XNF";
++
++int NativeAssets_SetXAVoiceLanguage(const char *language)
++{
++	for (int i = 0; i < (int)(sizeof(s_nativeAssetsXALanguages) / sizeof(s_nativeAssetsXALanguages[0])); i++)
++	{
++		if ((language != NULL) && (strcmp(language, s_nativeAssetsXALanguages[i]) == 0))
++		{
++			s_nativeAssetsXALanguage = i;
++			snprintf(s_nativeAssetsXNFPath, sizeof(s_nativeAssetsXNFPath), "XA/%s.XNF", language);
++			return 1;
++		}
++	}
++	return 0;
++}
++
++const char *NativeAssets_GetXAVoiceLanguage(void)
++{
++	return s_nativeAssetsXALanguages[s_nativeAssetsXALanguage];
++}
++
++const char *NativeAssets_GetXAVoiceXNFPath(void)
++{
++	return s_nativeAssetsXNFPath;
++}
++
+ struct NativeAssetIndexEntry
+ {
+ 	char *key;
+@@ -820,11 +850,14 @@ internal int NativeAssets_CheckRequiredFile(const char *path)
+ 
+ internal int NativeAssets_ValidateXA(void)
+ {
+-	local_persist const char *xaDirs[NATIVE_ASSETS_XA_TYPE_COUNT] = {
++	char xaVoiceExtra[32];
++	char xaVoiceGame[32];
++	const char *xaDirs[NATIVE_ASSETS_XA_TYPE_COUNT] = {
+ 	    "XA/MUSIC",
+-	    "XA/ENG/EXTRA",
+-	    "XA/ENG/GAME",
++	    xaVoiceExtra,
++	    xaVoiceGame,
+ 	};
++	u32 missingOptional = 0;
+ 	struct NativeAssetsByteBuffer xnf;
+ 	u8 required[NATIVE_ASSETS_XA_TYPE_COUNT][NATIVE_ASSETS_XA_MAX_FILE_NUMBER];
+ 	u32 numXasTotal;
+@@ -833,6 +866,8 @@ internal int NativeAssets_ValidateXA(void)
+ 	u32 missing = 0;
+ 	u32 categoryID;
+ 
++	snprintf(xaVoiceExtra, sizeof(xaVoiceExtra), "XA/%s/EXTRA", NativeAssets_GetXAVoiceLanguage());
++	snprintf(xaVoiceGame, sizeof(xaVoiceGame), "XA/%s/GAME", NativeAssets_GetXAVoiceLanguage());
+ 	memset(required, 0, sizeof(required));
+ 
+ 	if (!NativeAssets_ReadBytes(NATIVE_ASSETS_XNF_PATH, NATIVE_ASSET_READ_DATA_FILE, &xnf))
+@@ -914,12 +949,26 @@ internal int NativeAssets_ValidateXA(void)
+ 
+ 			if (!NativeAssets_ResolvePath(relativePath, path, sizeof(path)) && !NativeDiscImage_FindFile(relativePath, &discFile))
+ 			{
++#if defined(CTR_NATIVE_XA_MUSIC_OPTIONAL)
++				// ctr-web's converted data ships the voices only; the game
++				// plays on without the two XA music files.
++				if (categoryID == 0)
++				{
++					fprintf(stderr, "[CTR Native] optional XA asset not found: %s\n", path);
++					missingOptional++;
++					continue;
++				}
++#endif
+ 				fprintf(stderr, "[CTR Native] missing XA asset: %s\n", path);
+ 				missing++;
+ 			}
+ 		}
+ 	}
+ 
++	if (missingOptional != 0)
++	{
++		fprintf(stderr, "[CTR Native] %u optional XA music file(s) not found\n", (unsigned int)missingOptional);
++	}
+ 	return missing == 0;
+ }
+ 
+@@ -936,7 +985,25 @@ int NativeAssets_Validate(void)
+ 
+ 	ok &= NativeAssets_CheckRequiredFile(NATIVE_ASSETS_BIGFILE_PATH);
+ 	ok &= NativeAssets_CheckRequiredFile(NATIVE_ASSETS_KART_HWL_PATH);
++#if defined(CTR_NATIVE_TEST_STR_OPTIONAL)
++	// Only the Scrapbook plays TEST.STR; ctr-web's converted data omits it.
++	{
++		char path[NATIVE_ASSETS_PATH_MAX];
++		struct NativeDiscImageFile discFile;
++		if (!NativeAssets_ResolvePath(NATIVE_ASSETS_TEST_STR_PATH, path, sizeof(path)) && !NativeDiscImage_FindFile(NATIVE_ASSETS_TEST_STR_PATH, &discFile))
++		{
++			fprintf(stderr, "[CTR Native] optional asset not found: %s (Scrapbook video)\n", NATIVE_ASSETS_TEST_STR_PATH);
++		}
++	}
++#else
+ 	ok &= NativeAssets_CheckRequiredFile(NATIVE_ASSETS_TEST_STR_PATH);
++#endif
++	if (!NativeAssets_CheckRequiredFile(NATIVE_ASSETS_XNF_PATH) && (s_nativeAssetsXALanguage != 0))
++	{
++		// A disc image (or English data) has XA/ENG only: fall back to it.
++		fprintf(stderr, "[CTR Native] XA voices %s not found, using ENG\n", NativeAssets_GetXAVoiceLanguage());
++		NativeAssets_SetXAVoiceLanguage("ENG");
++	}
+ 	ok &= NativeAssets_CheckRequiredFile(NATIVE_ASSETS_XNF_PATH);
+ 
+ 	if (ok)
+diff --git a/platform/native_audio.c b/platform/native_audio.c
+index fed17397..942e35f8 100644
+--- a/platform/native_audio.c
++++ b/platform/native_audio.c
+@@ -1680,11 +1680,13 @@ internal int NativeAudio_BuildXAPath(char *path, size_t pathSize, int categoryID
+ 	}
+ 	else if (categoryID == 1)
+ 	{
+-		dir = "XA/ENG/EXTRA";
++		written = snprintf(path, pathSize, "XA/%s/EXTRA/S%02d.XA", NativeAssets_GetXAVoiceLanguage(), fileNumber);
++		return (written > 0) && ((size_t)written < pathSize);
+ 	}
+ 	else if (categoryID == 2)
+ 	{
+-		dir = "XA/ENG/GAME";
++		written = snprintf(path, pathSize, "XA/%s/GAME/S%02d.XA", NativeAssets_GetXAVoiceLanguage(), fileNumber);
++		return (written > 0) && ((size_t)written < pathSize);
+ 	}
+ 	else
+ 	{
+@@ -1712,7 +1714,7 @@ internal int NativeAudio_LookupXATrackInfo(int categoryID, int xaID, struct Nati
+ 		return 0;
+ 	}
+ 
+-	if (!NativeAudio_ReadFileBytes("XA/ENG.XNF", &xnf))
++	if (!NativeAudio_ReadFileBytes(NativeAssets_GetXAVoiceXNFPath(), &xnf))
+ 	{
+ 		return 0;
+ 	}
+diff --git a/platform/native_platform.c b/platform/native_platform.c
+index a03e6220..e2755eda 100644
+--- a/platform/native_platform.c
++++ b/platform/native_platform.c
+@@ -24,6 +24,8 @@
+ #include <string.h>
+ 
+ SDL_Window *g_window = NULL;
++// ctr-web: unlock characters, tracks, scrapbook and difficulties in the menu
++int g_cfg_unlockAll = 0;
+ int g_dbg_polygonSelected = 0;
+ 
+ extern int g_cfg_bilinearFiltering;
+diff --git a/platform/native_renderer.c b/platform/native_renderer.c
+index fc97ab2f..4266249e 100644
+--- a/platform/native_renderer.c
++++ b/platform/native_renderer.c
+@@ -219,6 +219,8 @@ int g_dbg_wireframeMode = 0;
+ int g_dbg_texturelessMode = 0;
+ 
+ int g_cfg_bilinearFiltering = 0;
++// ctr-web widescreen: 16:9 presentation, see PushBuffer.c
++int g_cfg_widescreen = 0;
+ 
+ // NOTE(aalhendi): Pack native RGBA render targets into the persistent RG8 VRAM
+ // texture on the GPU instead of a GPU-to-CPU-to-GPU round trip.
+-- 
+2.49.0
+

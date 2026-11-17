@@ -1,0 +1,340 @@
+From 863c5cefcae6d95d1f99c36ad37f6063e44685c7 Mon Sep 17 00:00:00 2001
+From: aignis <6974796+aignis@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 10:08:44 +0100
+Subject: [PATCH 2/5] switch2: own main() with SD logs and a large game stack,
+ lifecycle events, fatal screen
+
+switch2_main.c redirects stdout/stderr next to the NRO, runs the game on an
+8 MiB stack thread, and main.c shows a console message when the game data is
+missing instead of returning to hbmenu. The SDL subset reports HOME/sleep as
+SDL background/foreground events so the game pauses audio and rebases its
+VBlank clock.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                      |   2 +
+ main.c                              |  22 ++++++
+ platform/switch2/sdl3_switch2.c     |  84 ++++++++++++++++++++
+ platform/switch2/switch2_main.c     | 116 ++++++++++++++++++++++++++++
+ platform/switch2/switch2_platform.h |  21 +++++
+ 5 files changed, 245 insertions(+)
+ create mode 100644 platform/switch2/switch2_main.c
+ create mode 100644 platform/switch2/switch2_platform.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6cbb4bd3..17ad7ffd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -295,6 +295,8 @@ if(CTR_NATIVE_SWITCH2)
+     # (MIPS, x86 and Apple arm64 all default to it; AArch64 ELF does not).
+     set_target_properties(ctr_native PROPERTIES C_EXTENSIONS ON OUTPUT_NAME "ctr-native")
+     target_compile_options(ctr_native PRIVATE -fsigned-char)
++    # main() lives here (not in the library) so the linker always takes it.
++    target_sources(ctr_native PRIVATE platform/switch2/switch2_main.c)
+     set(CTR_SWITCH2_NRO_NAME "CTR Native" CACHE STRING "Title shown in hbmenu")
+     set(CTR_SWITCH2_NRO_AUTHOR "CTR-tools, CTRPad, ctr-web" CACHE STRING "Author shown in hbmenu")
+     nx_generate_nacp(ctr-native.nacp
+diff --git a/main.c b/main.c
+index db9dd6e7..9225fbd5 100644
+--- a/main.c
++++ b/main.c
+@@ -41,6 +41,9 @@
+ #include "platform/native_savestate.h"
+ #include "platform/native_state_digest.h"
+ #include "platform/native_storage.h"
++#if defined(CTR_NATIVE_SWITCH2)
++#include "platform/switch2/switch2_platform.h"
++#endif
+ 
+ #include <platform.h>
+ 
+@@ -615,7 +618,14 @@ static void NativeIOS_StopRuntimeForDiscReselection(void)
+ }
+ #endif
+ 
++#if defined(CTR_NATIVE_SWITCH2)
++// platform/switch2/switch2_main.c owns main() and calls this on a large stack.
++#define main CtrNative_Main
++#endif
+ int main(int argc, char *argv[])
++#if defined(CTR_NATIVE_SWITCH2)
++#undef main
++#endif
+ {
+ 	s32 scrapbookSTRProbeFrames = 0;
+ 	s32 scrapbookSTRPresentProbeFrames = 0;
+@@ -870,6 +880,18 @@ int main(int argc, char *argv[])
+ 			fflush(stdout);
+ 			return NativeConsole_Return(0);
+ 		}
++#endif
++#if defined(CTR_NATIVE_SWITCH2)
++		{
++			char message[1024];
++			snprintf(message, sizeof(message),
++			         "No se encuentran los datos del juego (o no son validos).\n\n"
++			         "Copia en %sassets/ los archivos BIGFILE.BIG, SOUNDS/KART.HWL\n"
++			         "y la carpeta XA/ (o una imagen ctr-u.bin NTSC-U).\n\n"
++			         "Detalles en %sstderr.log",
++			         sdlBasePath ? sdlBasePath : "", sdlBasePath ? sdlBasePath : "");
++			Switch2_ShowFatalMessage("Faltan los datos del juego", message);
++		}
+ #endif
+ 		return NativeConsole_Return(1);
+ 	}
+diff --git a/platform/switch2/sdl3_switch2.c b/platform/switch2/sdl3_switch2.c
+index b6d5ca21..1dfc8262 100644
+--- a/platform/switch2/sdl3_switch2.c
++++ b/platform/switch2/sdl3_switch2.c
+@@ -296,8 +296,85 @@ static void Switch2_PushEvent(const SDL_Event *event)
+ 	s_eventCount++;
+ }
+ 
++// Lifecycle: the system suspends the process on HOME and sleep. The game's
++// lifecycle code (native_platform.c) expects SDL's background/foreground
++// events to pause audio and input and to rebase its VBlank clock on return.
++static AppletHookCookie s_appletCookie;
++static bool s_appletHooked;
++static bool s_background;
++static u64 s_lastPumpTick;
++
++static void Switch2_PushType(Uint32 type)
++{
++	SDL_Event event;
++	memset(&event, 0, sizeof(event));
++	event.type = type;
++	Switch2_PushEvent(&event);
++}
++
++static void Switch2_EnterBackground(void)
++{
++	if (s_background)
++	{
++		return;
++	}
++	s_background = true;
++	Switch2_PushType(SDL_EVENT_WILL_ENTER_BACKGROUND);
++	Switch2_PushType(SDL_EVENT_DID_ENTER_BACKGROUND);
++}
++
++static void Switch2_EnterForeground(void)
++{
++	if (!s_background)
++	{
++		return;
++	}
++	s_background = false;
++	Switch2_PushType(SDL_EVENT_WILL_ENTER_FOREGROUND);
++	Switch2_PushType(SDL_EVENT_DID_ENTER_FOREGROUND);
++}
++
++static void Switch2_AppletHook(AppletHookType hook, void *param)
++{
++	(void)param;
++	switch (hook)
++	{
++	case AppletHookType_OnFocusState:
++		if (appletGetFocusState() == AppletFocusState_Background)
++		{
++			Switch2_EnterBackground();
++		}
++		else if (appletGetFocusState() == AppletFocusState_InFocus)
++		{
++			Switch2_EnterForeground();
++		}
++		break;
++	case AppletHookType_OnResume:
++		Switch2_EnterForeground();
++		break;
++	default:
++		break;
++	}
++}
++
+ void SDL_PumpEvents(void)
+ {
++	const u64 now = armGetSystemTick();
++
++	if (!s_appletHooked)
++	{
++		appletHook(&s_appletCookie, Switch2_AppletHook, NULL);
++		s_appletHooked = true;
++	}
++	// A suspension that no focus message reported still shows up as a gap
++	// between pumps; treat a long one as a trip to the background.
++	if ((s_lastPumpTick != 0) && !s_background && (armTicksToNs(now - s_lastPumpTick) > 3000000000ull))
++	{
++		Switch2_EnterBackground();
++		Switch2_EnterForeground();
++	}
++	s_lastPumpTick = now;
++
+ 	if (!appletMainLoop() && !s_quitSent)
+ 	{
+ 		SDL_Event quit;
+@@ -307,6 +384,13 @@ void SDL_PumpEvents(void)
+ 		Switch2_PushEvent(&quit);
+ 	}
+ 	Switch2_PadUpdate();
++	if (s_background)
++	{
++		// Not suspended but not in front (should not happen with the default
++		// focus mode): do not spin while the game loop waits.
++		svcSleepThread(16000000ll);
++	}
++	s_lastPumpTick = armGetSystemTick();
+ }
+ 
+ bool SDL_PollEvent(SDL_Event *event)
+diff --git a/platform/switch2/switch2_main.c b/platform/switch2/switch2_main.c
+new file mode 100644
+index 00000000..236d76de
+--- /dev/null
++++ b/platform/switch2/switch2_main.c
+@@ -0,0 +1,116 @@
++// SPDX-License-Identifier: Zlib
++//
++// Switch 2 entry point: redirect stdout/stderr to a file next to the NRO, run
++// the game on a thread with a large stack (hbloader's main thread stack is
++// sized for small homebrew, the desktop build assumes megabytes), and report
++// a fatal start-up error on screen instead of returning to hbmenu silently.
++#include <switch.h>
++
++#include <SDL3/SDL.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "switch2_platform.h"
++
++#ifndef CTR_SWITCH2_STACK_SIZE
++#define CTR_SWITCH2_STACK_SIZE (8u * 1024u * 1024u)
++#endif
++
++struct Switch2MainArgs
++{
++	int argc;
++	char **argv;
++	int result;
++};
++
++static void Switch2_GameThread(void *arg)
++{
++	struct Switch2MainArgs *args = (struct Switch2MainArgs *)arg;
++	args->result = CtrNative_Main(args->argc, args->argv);
++}
++
++static void Switch2_RedirectOutput(void)
++{
++	char path[600];
++	const char *base = SDL_GetBasePath();
++
++	// stdout.log/stderr.log keep everything that is printed before the game's
++	// own rotating log opens, plus Mesa's messages (it writes to stderr).
++	snprintf(path, sizeof(path), "%sstdout.log", base);
++	if (freopen(path, "w", stdout) != NULL)
++	{
++		setvbuf(stdout, NULL, _IOLBF, 0);
++	}
++	snprintf(path, sizeof(path), "%sstderr.log", base);
++	if (freopen(path, "w", stderr) != NULL)
++	{
++		setvbuf(stderr, NULL, _IOLBF, 0);
++	}
++	printf("[Switch2] CTR Native for Switch 2 (kaiHEN), base %s\n", base);
++	printf("[Switch2] applet type %d, operation mode %d\n", (int)appletGetAppletType(), (int)appletGetOperationMode());
++}
++
++void Switch2_ShowFatalMessage(const char *title, const char *message)
++{
++	PadState pad;
++
++	fprintf(stderr, "[Switch2] fatal: %s: %s\n", title ? title : "", message ? message : "");
++	fflush(stdout);
++	fflush(stderr);
++
++	consoleInit(NULL);
++	padConfigureInput(1, HidNpadStyleSet_NpadStandard);
++	padInitializeDefault(&pad);
++	printf("\x1b[2J\x1b[1;1H");
++	printf("CTR Native (Switch 2)\n\n%s\n\n%s\n\nPulsa + para salir.\n", title ? title : "", message ? message : "");
++	consoleUpdate(NULL);
++	while (appletMainLoop())
++	{
++		padUpdate(&pad);
++		if (padGetButtonsDown(&pad) & HidNpadButton_Plus)
++		{
++			break;
++		}
++		consoleUpdate(NULL);
++		svcSleepThread(16000000ll);
++	}
++	consoleExit(NULL);
++}
++
++int main(int argc, char *argv[])
++{
++	struct Switch2MainArgs args = {argc, argv, 1};
++	Thread thread;
++	Result rc;
++
++	Switch2_RedirectOutput();
++	if (chdir(SDL_GetBasePath()) != 0)
++	{
++		fprintf(stderr, "[Switch2] chdir %s failed\n", SDL_GetBasePath());
++	}
++
++	// Same priority as the main thread (0x2C), on core 0; audio runs on core 2.
++	rc = threadCreate(&thread, Switch2_GameThread, &args, NULL, CTR_SWITCH2_STACK_SIZE, 0x2C, 0);
++	if (R_SUCCEEDED(rc))
++	{
++		rc = threadStart(&thread);
++		if (R_SUCCEEDED(rc))
++		{
++			threadWaitForExit(&thread);
++		}
++		threadClose(&thread);
++	}
++	if (R_FAILED(rc))
++	{
++		fprintf(stderr, "[Switch2] game thread failed (0x%x); running on the main thread\n", rc);
++		args.result = CtrNative_Main(argc, argv);
++	}
++
++	printf("[Switch2] exit %d\n", args.result);
++	fflush(stdout);
++	fflush(stderr);
++	return args.result;
++}
+diff --git a/platform/switch2/switch2_platform.h b/platform/switch2/switch2_platform.h
+new file mode 100644
+index 00000000..5ade571b
+--- /dev/null
++++ b/platform/switch2/switch2_platform.h
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: Zlib
++// Switch 2 (kaiHEN) entry point helpers. See platform/switch2/README.md.
++#pragma once
++
++#if defined(CTR_NATIVE_SWITCH2)
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// The game's main(), renamed by main.c so that switch2_main.c can run it on a
++// thread with a desktop-sized stack after redirecting stdout/stderr to the SD.
++int CtrNative_Main(int argc, char *argv[]);
++
++// Shows a text screen on the console (libnx console) and waits for + or for
++// the system to close the program. For errors before the renderer exists.
++void Switch2_ShowFatalMessage(const char *title, const char *message);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+-- 
+2.49.0
+

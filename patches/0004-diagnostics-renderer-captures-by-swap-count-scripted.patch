@@ -1,0 +1,277 @@
+From 8f6d5df32fcba961cc07ffb39e8d39d466671a39 Mon Sep 17 00:00:00 2001
+From: aignis <6974796+aignis@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 10:27:28 +0100
+Subject: [PATCH 4/5] diagnostics: renderer captures by swap count, scripted
+ pad input; desktop env overrides
+
+NativeRenderer captures capture_<n>.bmp at the swap counts in
+CTR_NATIVE_CAPTURE_SWAPS (or capture_swaps in Switch 2's ctr-native.ini),
+without SDL surfaces so it works on the console. Internal builds read
+CTR_NATIVE_AUTOPAD to hold pad bits during given input updates.
+CTR_NATIVE_VOICES/WIDESCREEN/UNLOCK_ALL set the ctr-web options on desktop.
+Used to check the LP64 build with ctr-web's PAL data on Apple Silicon: main
+menu, Spanish text, widescreen and a time trial race render correctly.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/platform/native_renderer.h |   1 +
+ main.c                             |  31 ++++++++-
+ platform/native_input.c            |  47 +++++++++++++
+ platform/native_renderer.c         | 105 +++++++++++++++++++++++++++++
+ 4 files changed, 182 insertions(+), 2 deletions(-)
+
+diff --git a/include/platform/native_renderer.h b/include/platform/native_renderer.h
+index 45b60413..42ec46ec 100644
+--- a/include/platform/native_renderer.h
++++ b/include/platform/native_renderer.h
+@@ -16,6 +16,7 @@ void NativeRenderer_FinishGpuMeasurements(void);
+ void NativeRenderer_UpdateSwapIntervalState(int swapInterval);
+ void NativeRenderer_SwapWindow(void);
+ int NativeRenderer_SetInternalResolutionScale(int scale);
++void NativeRenderer_SetCaptureSwaps(const char *list);
+ void NativeRenderer_StoreFrameBuffer(int x, int y, int w, int h);
+ void NativeRenderer_PresentMainRenderTarget(void);
+ void NativeRenderer_PresentVRAMDisplay(void);
+diff --git a/main.c b/main.c
+index f405e54b..0d796d38 100644
+--- a/main.c
++++ b/main.c
+@@ -400,6 +400,11 @@ static void Switch2Config_Set(const char *key, const char *value)
+ 	{
+ 		g_cfg_unlockAll = number != 0;
+ 	}
++	else if (strcmp(key, "capture_swaps") == 0)
++	{
++		// diagnostics: capture_<n>.bmp next to the NRO at these swap counts
++		NativeRenderer_SetCaptureSwaps(value);
++	}
+ }
+ 
+ static void Switch2Config_Load(const char *basePath)
+@@ -578,8 +583,16 @@ static int NativeApp_StartRuntime(const struct NativeLaunchOptions *options)
+ 	printf("[CTR Native] Widescreen\n");
+ 	Platform_Init("Crash Team Racing", 1280, 720);
+ #else
+-	printf("[CTR Native] 4:3\n");
+-	Platform_Init("Crash Team Racing", 800, 600);
++	if (g_cfg_widescreen)
++	{
++		printf("[CTR Native] Widescreen\n");
++		Platform_Init("Crash Team Racing", 1280, 720);
++	}
++	else
++	{
++		printf("[CTR Native] 4:3\n");
++		Platform_Init("Crash Team Racing", 800, 600);
++	}
+ #endif
+ 	if (!Platform_IsInitialized())
+ 	{
+@@ -919,6 +932,20 @@ int main(int argc, char *argv[])
+ 	fflush(stdout);
+ #if defined(CTR_NATIVE_SWITCH2)
+ 	Switch2Config_Load(sdlBasePath);
++#else
++	// Desktop overrides for the ctr-web options (Switch 2 reads ctr-native.ini).
++	if (getenv("CTR_NATIVE_VOICES") != NULL)
++	{
++		NativeAssets_SetXAVoiceLanguage(getenv("CTR_NATIVE_VOICES"));
++	}
++	if (getenv("CTR_NATIVE_WIDESCREEN") != NULL)
++	{
++		g_cfg_widescreen = atoi(getenv("CTR_NATIVE_WIDESCREEN")) != 0;
++	}
++	if (getenv("CTR_NATIVE_UNLOCK_ALL") != NULL)
++	{
++		g_cfg_unlockAll = atoi(getenv("CTR_NATIVE_UNLOCK_ALL")) != 0;
++	}
+ #endif
+ 	if (!NativeStorage_Init(sdlBasePath))
+ 	{
+diff --git a/platform/native_input.c b/platform/native_input.c
+index 2e3f7abf..830105c7 100644
+--- a/platform/native_input.c
++++ b/platform/native_input.c
+@@ -827,6 +827,50 @@ internal u16 NativeInput_ReadKeyboard(void)
+ 	return buttons;
+ }
+ 
++#if defined(CTR_INTERNAL)
++// Diagnostics: CTR_NATIVE_AUTOPAD="300-305:40,360-365:4000" holds PS1 pad bits
++// (Up 0x10, Right 0x20, Down 0x40, Left 0x80, Start 0x8, Cross 0x4000,
++// Circle 0x2000, ...) during those input updates, on the keyboard's pad.
++global_variable u32 s_autopadUpdate;
++
++internal u16 NativeInput_AutopadMask(void)
++{
++	local_persist const char *script;
++	local_persist int loaded;
++	const char *p;
++	u16 mask = 0;
++
++	if (!loaded)
++	{
++		script = getenv("CTR_NATIVE_AUTOPAD");
++		loaded = 1;
++	}
++	s_autopadUpdate++;
++	for (p = script; (p != NULL) && (*p != '\0');)
++	{
++		char *end;
++		unsigned long first = strtoul(p, &end, 10);
++		unsigned long last = first;
++		unsigned long bits;
++		if (*end == '-')
++		{
++			last = strtoul(end + 1, &end, 10);
++		}
++		if (*end != ':')
++		{
++			break;
++		}
++		bits = strtoul(end + 1, &end, 16);
++		if ((s_autopadUpdate >= first) && (s_autopadUpdate <= last))
++		{
++			mask |= (u16)bits;
++		}
++		p = (*end == ',') ? end + 1 : end;
++	}
++	return mask;
++}
++#endif
++
+ internal u16 NativeInput_ConsumeKeyboard(void)
+ {
+ 	return NativeInput_ReadKeyboard();
+@@ -1186,6 +1230,9 @@ void Platform_InputUpdate(void)
+ 
+ 	SDL_PumpEvents();
+ 	keyboardButtons = NativeInput_ConsumeKeyboard();
++#if defined(CTR_INTERNAL)
++	keyboardButtons &= (u16)~NativeInput_AutopadMask();
++#endif
+ 	mouseButtons = NativeInput_ConsumeMouseButtons();
+ 	touchButtons = NativeInput_ConsumeTouchButtons();
+ 	if (NativeInput_KeyboardSuppressed())
+diff --git a/platform/native_renderer.c b/platform/native_renderer.c
+index 4266249e..4133b726 100644
+--- a/platform/native_renderer.c
++++ b/platform/native_renderer.c
+@@ -2594,9 +2594,114 @@ void NativeRenderer_PresentVRAMDisplay(void)
+ 	NativeRenderer_PresentVRAMRect(activeDispEnv.disp.x, activeDispEnv.disp.y, activeDispEnv.disp.w, activeDispEnv.disp.h);
+ }
+ 
++// Diagnostic captures: "120,600" writes capture_<swap>.bmp (the presented
++// window, before the swap) at those swap counts, in the working directory.
++global_variable char s_captureSwaps[256];
++global_variable int s_captureSwapsLoaded;
++global_variable u32 s_captureSwapCount;
++
++void NativeRenderer_SetCaptureSwaps(const char *list)
++{
++	snprintf(s_captureSwaps, sizeof(s_captureSwaps), "%s", list ? list : "");
++	s_captureSwapsLoaded = 1;
++}
++
++internal int NativeRenderer_CaptureWanted(u32 swap)
++{
++	const char *p;
++	if (!s_captureSwapsLoaded)
++	{
++		NativeRenderer_SetCaptureSwaps(getenv("CTR_NATIVE_CAPTURE_SWAPS"));
++	}
++	for (p = s_captureSwaps; *p != '\0';)
++	{
++		char *end;
++		const unsigned long value = strtoul(p, &end, 10);
++		if (end == p)
++		{
++			p++;
++			continue;
++		}
++		if (value == swap)
++		{
++			return 1;
++		}
++		p = end;
++	}
++	return 0;
++}
++
++internal void NativeRenderer_CaptureWindow(u32 swap)
++{
++	const int w = g_windowWidth;
++	const int h = g_windowHeight;
++	const int rowBytes = ((w * 3) + 3) & ~3;
++	u8 *rgba;
++	u8 *row;
++	FILE *file;
++	char name[64];
++	u8 header[54];
++	const u32 imageBytes = (u32)rowBytes * (u32)h;
++	const u32 fileBytes = 54u + imageBytes;
++
++	if ((w <= 0) || (h <= 0))
++	{
++		return;
++	}
++	rgba = (u8 *)malloc((size_t)w * (size_t)h * 4);
++	row = (u8 *)calloc(1, (size_t)rowBytes);
++	snprintf(name, sizeof(name), "capture_%u.bmp", (unsigned int)swap);
++	file = fopen(name, "wb");
++	if ((rgba == NULL) || (row == NULL) || (file == NULL))
++	{
++		free(rgba);
++		free(row);
++		if (file)
++		{
++			fclose(file);
++		}
++		return;
++	}
++	glBindFramebuffer(GL_READ_FRAMEBUFFER, s_presentFramebuffer);
++	glPixelStorei(GL_PACK_ALIGNMENT, 1);
++	glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
++	memset(header, 0, sizeof(header));
++	header[0] = 'B';
++	header[1] = 'M';
++	memcpy(&header[2], &fileBytes, 4);
++	header[10] = 54;
++	header[14] = 40;
++	memcpy(&header[18], &w, 4);
++	memcpy(&header[22], &h, 4); // bottom-up rows, as glReadPixels returns them
++	header[26] = 1;
++	header[28] = 24;
++	memcpy(&header[34], &imageBytes, 4);
++	fwrite(header, 1, sizeof(header), file);
++	for (int y = 0; y < h; y++)
++	{
++		const u8 *src = &rgba[(size_t)y * (size_t)w * 4];
++		for (int x = 0; x < w; x++)
++		{
++			row[x * 3 + 0] = src[x * 4 + 2];
++			row[x * 3 + 1] = src[x * 4 + 1];
++			row[x * 3 + 2] = src[x * 4 + 0];
++		}
++		fwrite(row, 1, (size_t)rowBytes, file);
++	}
++	fclose(file);
++	free(rgba);
++	free(row);
++	Platform_Log("[CTR Renderer] capture swap=%u %dx%d -> %s\n", (unsigned int)swap, w, h, name);
++}
++
+ void NativeRenderer_SwapWindow(void)
+ {
+ 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_SWAP_WINDOW);
++	s_captureSwapCount++;
++	if (NativeRenderer_CaptureWanted(s_captureSwapCount))
++	{
++		NativeRenderer_CaptureWindow(s_captureSwapCount);
++	}
+ 	if (s_presentRenderbuffer != 0)
+ 	{
+ 		glBindRenderbuffer(GL_RENDERBUFFER, s_presentRenderbuffer);
+-- 
+2.49.0
+

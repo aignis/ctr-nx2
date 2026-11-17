@@ -1,0 +1,233 @@
+From 4e0d1199277e52e3f04109c8cfbbf9ccca3c15ad Mon Sep 17 00:00:00 2001
+From: aignis <6974796+aignis@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 11:56:53 +0100
+Subject: [PATCH] native libpad: stream the actuator buffer so rumble reaches
+ the host
+
+PadSetMainMode returned 0, so GAMEPAD_ProcessState never registered the
+motor buffer, and PadSetAct sent it once instead of every poll as libpad
+does. Accept analog mode, report two DualShock actuators, and send the
+registered buffer from PadGetState (on change, refreshed every 6 polls
+while active). Switch 2: honour duration_ms (HID holds the last value),
+stop at zero, and log vibration init and the first sends to stderr.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ platform/native_libpad.c        | 70 ++++++++++++++++++++++++++++++---
+ platform/switch2/sdl3_switch2.c | 63 +++++++++++++++++++++++++++--
+ 2 files changed, 124 insertions(+), 9 deletions(-)
+
+diff --git a/platform/native_libpad.c b/platform/native_libpad.c
+index 989de584..b11d1f87 100644
+--- a/platform/native_libpad.c
++++ b/platform/native_libpad.c
+@@ -24,16 +24,68 @@ void PadStopCom(void)
+ 	g_padCommEnable = 0;
+ }
+ 
++// Like the real libpad, PadSetAct registers the actuator buffer and the
++// driver sends its current contents on every poll. GAMEPAD_ProcessMotors
++// rewrites motorSubmit each frame and GAMEPAD_PollVsync calls PadGetState for
++// each connected pad each VBlank, so the buffer is streamed from there.
++#define NATIVE_PAD_ACT_PORTS 32
++#define NATIVE_PAD_ACT_REFRESH 6 // resend unchanged values (host rumble lasts 200 ms)
++
++static unsigned char *s_padActTable[NATIVE_PAD_ACT_PORTS];
++static int s_padActLen[NATIVE_PAD_ACT_PORTS];
++static unsigned char s_padActSent[NATIVE_PAD_ACT_PORTS][2];
++static int s_padActAge[NATIVE_PAD_ACT_PORTS];
++
++static void NativePad_StreamAct(int port)
++{
++	const int i = port & (NATIVE_PAD_ACT_PORTS - 1);
++	unsigned char now[2];
++
++	if (s_padActTable[i] == NULL)
++	{
++		return;
++	}
++	now[0] = s_padActTable[i][0];
++	now[1] = s_padActLen[i] > 1 ? s_padActTable[i][1] : 0;
++	if ((now[0] == s_padActSent[i][0]) && (now[1] == s_padActSent[i][1]))
++	{
++		// Idle motors need no refresh; active ones are refreshed before the
++		// host-side duration runs out.
++		if (((now[0] | now[1]) == 0) || (++s_padActAge[i] < NATIVE_PAD_ACT_REFRESH))
++		{
++			return;
++		}
++	}
++	s_padActSent[i][0] = now[0];
++	s_padActSent[i][1] = now[1];
++	s_padActAge[i] = 0;
++	Platform_InputPadVibrate(port, now, 2);
++}
++
+ int PadGetState(int port)
+ {
+-	return Platform_InputPadGetState(port);
++	const int state = Platform_InputPadGetState(port);
++
++	if (state == PadStateStable)
++	{
++		NativePad_StreamAct(port);
++	}
++	return state;
+ }
+ 
+ int PadInfoAct(int port, int acno, int term)
+ {
+ 	(void)port;
+-	(void)acno;
+-	(void)term;
++	// A DualShock: two actuators, small (on/off) and large (variable), with
++	// the current draw libpad reports for each (60 units per port maximum).
++	if (acno < 0)
++	{
++		return 2;
++	}
++	if (term == 4)
++	{
++		return acno == 0 ? 10 : 20;
++	}
+ 	return 0;
+ }
+ 
+@@ -49,10 +101,18 @@ int PadSetMainMode(int socket, int offs, int lock)
+ 	(void)socket;
+ 	(void)offs;
+ 	(void)lock;
+-	return 0;
++	// Accept the switch to analog mode so the game goes on to register the
++	// actuator buffer (GAMEPAD_ProcessState: gamepadType 0 -> 1 -> 2).
++	return 1;
+ }
+ 
+ void PadSetAct(int port, unsigned char *table, int len)
+ {
+-	Platform_InputPadVibrate(port, table, len);
++	const int i = port & (NATIVE_PAD_ACT_PORTS - 1);
++
++	s_padActTable[i] = table;
++	s_padActLen[i] = len;
++	s_padActSent[i][0] = 0;
++	s_padActSent[i][1] = 0;
++	s_padActAge[i] = 0;
+ }
+diff --git a/platform/switch2/sdl3_switch2.c b/platform/switch2/sdl3_switch2.c
+index 52bee0d7..478ec39c 100644
+--- a/platform/switch2/sdl3_switch2.c
++++ b/platform/switch2/sdl3_switch2.c
+@@ -858,6 +858,11 @@ static bool s_padConnected[SWITCH2_MAX_PADS];
+ static struct SDL_Gamepad s_gamepads[SWITCH2_MAX_PADS];
+ static HidVibrationDeviceHandle s_vibration[SWITCH2_MAX_PADS][2];
+ static bool s_vibrationReady[SWITCH2_MAX_PADS];
++static bool s_vibrationActive[SWITCH2_MAX_PADS];
++static Uint64 s_vibrationEndNS[SWITCH2_MAX_PADS];
++static int s_vibrationLogCount;
++
++static void Switch2_StopVibration(int index);
+ 
+ static void Switch2_PadInit(void)
+ {
+@@ -903,8 +908,15 @@ static void Switch2_PadUpdate(void)
+ 			event.gdevice.which = (SDL_JoystickID)(i + 1);
+ 			s_padConnected[i] = connected;
+ 			s_vibrationReady[i] = false;
++			s_vibrationActive[i] = false;
+ 			Switch2_PushEvent(&event);
+ 		}
++		// SDL rumble stops after duration_ms unless renewed; HID keeps the
++		// last value forever, so stop it here (game paused, HOME, hang).
++		if (connected && s_vibrationActive[i] && (SDL_GetTicksNS() >= s_vibrationEndNS[i]))
++		{
++			Switch2_StopVibration(i);
++		}
+ 		if (connected && !s_quitSent)
+ 		{
+ 			const u64 buttons = padGetButtons(&s_pads[i]);
+@@ -1112,14 +1124,38 @@ static bool Switch2_PrepareVibration(int index)
+ 			style = HidNpadStyleTag_NpadJoyDual;
+ 		}
+ 	}
+-	if (R_FAILED(hidInitializeVibrationDevices(s_vibration[index], 2, id, style)))
+ 	{
+-		return false;
++		const Result rc = hidInitializeVibrationDevices(s_vibration[index], 2, id, style);
++		fprintf(stderr, "[Switch2] vibration init pad %d id=%d style=0x%x styleSet=0x%x rc=0x%x\n",
++		        index, (int)id, (unsigned)style, (unsigned)styleSet, (unsigned)rc);
++		if (R_FAILED(rc))
++		{
++			return false;
++		}
+ 	}
+ 	s_vibrationReady[index] = true;
+ 	return true;
+ }
+ 
++static void Switch2_StopVibration(int index)
++{
++	HidVibrationValue values[2];
++
++	s_vibrationActive[index] = false;
++	if (!s_vibrationReady[index])
++	{
++		return;
++	}
++	for (int i = 0; i < 2; i++)
++	{
++		values[i].amp_low = 0.0f;
++		values[i].freq_low = 160.0f;
++		values[i].amp_high = 0.0f;
++		values[i].freq_high = 320.0f;
++	}
++	hidSendVibrationValues(s_vibration[index], values, 2);
++}
++
+ bool SDL_RumbleGamepad(SDL_Gamepad *gamepad, Uint16 low_frequency_rumble, Uint16 high_frequency_rumble, Uint32 duration_ms)
+ {
+ 	const int index = gamepad ? Switch2_PadIndex(gamepad->id) : -1;
+@@ -1127,11 +1163,15 @@ bool SDL_RumbleGamepad(SDL_Gamepad *gamepad, Uint16 low_frequency_rumble, Uint16
+ 	float low = (float)low_frequency_rumble / 65535.0f;
+ 	float high = (float)high_frequency_rumble / 65535.0f;
+ 
+-	(void)duration_ms; // the game sends a new value (or zero) every frame
+ 	if ((index < 0) || !s_padConnected[index] || !Switch2_PrepareVibration(index))
+ 	{
+ 		return false;
+ 	}
++	if ((low_frequency_rumble | high_frequency_rumble) == 0)
++	{
++		Switch2_StopVibration(index);
++		return true;
++	}
+ 	for (int i = 0; i < 2; i++)
+ 	{
+ 		values[i].amp_low = low;
+@@ -1139,7 +1179,22 @@ bool SDL_RumbleGamepad(SDL_Gamepad *gamepad, Uint16 low_frequency_rumble, Uint16
+ 		values[i].amp_high = high;
+ 		values[i].freq_high = 320.0f;
+ 	}
+-	return R_SUCCEEDED(hidSendVibrationValues(s_vibration[index], values, 2));
++	{
++		const Result rc = hidSendVibrationValues(s_vibration[index], values, 2);
++		if (s_vibrationLogCount < 8)
++		{
++			s_vibrationLogCount++;
++			fprintf(stderr, "[Switch2] rumble pad %d low=%u high=%u rc=0x%x\n",
++			        index, (unsigned)low_frequency_rumble, (unsigned)high_frequency_rumble, (unsigned)rc);
++		}
++		if (R_FAILED(rc))
++		{
++			return false;
++		}
++	}
++	s_vibrationActive[index] = true;
++	s_vibrationEndNS[index] = SDL_GetTicksNS() + (Uint64)duration_ms * 1000000ull;
++	return true;
+ }
+ 
+ int SDL_AddGamepadMappingsFromFile(const char *file)
+-- 
+2.49.0
+

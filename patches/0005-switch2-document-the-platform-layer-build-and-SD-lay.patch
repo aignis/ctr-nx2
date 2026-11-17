@@ -1,0 +1,77 @@
+From 46915e59e95dbd85beab57016c1f4d79ca9e132a Mon Sep 17 00:00:00 2001
+From: aignis <6974796+aignis@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 10:31:54 +0100
+Subject: [PATCH 5/5] switch2: document the platform layer, build and SD layout
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ platform/switch2/README.md | 57 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+ create mode 100644 platform/switch2/README.md
+
+diff --git a/platform/switch2/README.md b/platform/switch2/README.md
+new file mode 100644
+index 00000000..e1c19888
+--- /dev/null
++++ b/platform/switch2/README.md
+@@ -0,0 +1,57 @@
++# Switch 2 (kaiHEN)
++
++Homebrew build for Nintendo Switch 2 running kaiHEN, with the
++[ounce-devkit](https://github.com/ouncebrew/ounce-devkit): libounce (libnx for
++Switch 2) and OunceVK (Vulkan, and EGL/OpenGL ES through Zink).
++
++## Build
++
++```sh
++source $DEVKITPRO/switch2vars.sh
++aarch64-none-elf-cmake -S . -B build-switch2 -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
++cmake --build build-switch2      # -> build-switch2/ctr-native.nro
++```
++
++The toolchain sets `NINTENDO_SWITCH2`, which turns on `CTR_NATIVE_SWITCH2`,
++the GLES 3 renderer and `-fsigned-char` (the PS1 code assumes a signed char,
++which AArch64 ELF does not give by default).
++
++## Platform layer
++
++SDL3 has no Switch platform. `sdl3_switch2.c` implements the SDL3 calls this
++tree makes, compiled against SDL3's own headers (`externals/SDL/include`) so
++types, enums and scancodes are exact and the callers are unchanged:
++
++| SDL area | Switch 2 |
++| --- | --- |
++| window, GL context, swap | EGL on `nwindowGetDefault()`, 1920x1080 in both modes |
++| GL loader | `eglGetProcAddress` |
++| gamepads | libnx `pad`, players 1-4 (player 1 includes handheld); SOUTH = B |
++| rumble | `hidSendVibrationValues` |
++| audio stream | audren voice at the stream's rate (44.1 kHz), 4 x 1024-frame buffers, mixing thread on core 2 |
++| events | `appletMainLoop` (quit), pad connect/disconnect, HOME/sleep as background/foreground |
++| time | `armGetSystemTick` |
++| paths | base = directory of the NRO from argv (default `sdmc:/switch/ctr-native/`) |
++
++Keyboard, mouse, SDL surfaces and virtual joysticks are not provided.
++
++`switch2_main.c` owns `main()`: it redirects stdout/stderr to `stdout.log` and
++`stderr.log` next to the NRO, and runs the game (`CtrNative_Main`) on an
++8 MiB stack. Missing game data shows a text screen instead of exiting.
++
++## SD card
++
++```
++sdmc:/switch/ctr-native/
++  ctr-native.nro
++  ctr-native.ini        written with defaults on first start
++  assets/BIGFILE.BIG, assets/SOUNDS/KART.HWL, assets/XA/...   (or assets/ctr-u.bin)
++```
++
++`ctr-native.ini`: `widescreen`, `internal_scale` (1-4), `bilinear`, `voices`
++(ENG, SPN, ...), `unlock_all`, `capture_swaps` (diagnostic BMP captures).
++
++`CTR_SWITCH2_CTR_WEB_ASSETS` (default ON) is for data converted from the PAL
++disc by ctr-web: PAL VRAM layout (`CTR_SWAPCHAIN_Y=0xEC`), no XA music and no
++`TEST.STR`. Turn it OFF for an NTSC-U `ctr-u.bin`. `CTR_SWITCH2_SKIP_INTRO`
++(default ON) boots into the main menu.
+-- 
+2.49.0
+

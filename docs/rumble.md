@@ -1,0 +1,9 @@
+# Controller rumble investigation
+
+The current Switch 2 backend obtains two vibration handles for a connected pad and sends the same value to both. It maps the original large-motor intensity into a 160 Hz low-frequency band and the small-motor intensity into a 320 Hz high-frequency band, with the high band additionally halved. The user's 0–100 setting scales the amplitudes. The menu preview uses the low band on both handles for 250 ms. See `platform/switch2/sdl3_switch2.c` after running `setup-source.sh`.
+
+The open-source [libnx HID definitions](https://github.com/switchbrew/libnx/blob/master/nx/include/switch/services/hid.h) distinguish left and right vibration-device positions and identify linear resonant actuators. [Switch2Kit's controller coverage](https://github.com/jmonster/Switch2Kit/blob/main/docs/switch2kit/coverage.md) describes independent HD motors for the Switch 2 Pro Controller; its authors explicitly distinguish their software contract from physical acceptance testing. Nintendo lists [HD rumble 2](https://www.nintendo.com/ph/hardware/switch2/accessories/controller.html) in the controller specifications.
+
+These sources do not establish an independently addressable central motor, nor do they identify which physical source causes a particular audible buzz. Two frequency bands in a single vibration value should not be confused with two additional motors. Audible feedback may be caused by the frequency, amplitude, mechanical resonance, enclosure or a combination; this has not yet been isolated on the user's controller.
+
+A useful hardware experiment would play short, matched pulses on the left and right handles independently, then compare low-band-only with mixed-band output at several conservative amplitudes. Test both a Pro Controller and Joy-Con configurations. Do not assume that a change sounds or feels better until tested on the actual hardware. No haptic tuning change is included solely on the basis of this investigation.

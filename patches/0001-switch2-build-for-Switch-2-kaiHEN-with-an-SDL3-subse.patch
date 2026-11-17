@@ -1,0 +1,1708 @@
+From e6b0fff28e17078f3f69b91edcc816896771f034 Mon Sep 17 00:00:00 2001
+From: aignis <6974796+aignis@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 10:02:25 +0100
+Subject: [PATCH 1/5] switch2: build for Switch 2 (kaiHEN) with an SDL3 subset
+ on libnx
+
+NINTENDO_SWITCH2 (libounce toolchain) builds ctr-native.nro. SDL3 has no
+Switch platform, so platform/switch2/sdl3_switch2.c implements the SDL3
+calls this tree makes, against SDL3's own headers: EGL on the default
+NWindow, libnx pad for four players, audren for audio, armGetSystemTick.
+-fsigned-char because the PS1 code assumes a signed char.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                  |   39 +-
+ platform/native_glad.c          |   17 +
+ platform/switch2/sdl3_switch2.c | 1580 +++++++++++++++++++++++++++++++
+ 3 files changed, 1635 insertions(+), 1 deletion(-)
+ create mode 100644 platform/switch2/sdl3_switch2.c
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3ecd73fc..6cbb4bd3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -20,7 +20,16 @@ set(CTR_NATIVE_IOS_BUNDLE_IDENTIFIER "io.github.chrissotraidis.ctrpad" CACHE STR
+ )
+ 
+ set(CTR_NATIVE_RENDERER_GLES_DEFAULT OFF)
+-if(ANDROID OR IOS)
++set(CTR_NATIVE_SWITCH2 OFF)
++if(NINTENDO_SWITCH2)
++    # Switch 2 homebrew (kaiHEN): libounce + OunceVK (EGL/GLES through Zink).
++    # SDL3 has no Switch platform, so platform/switch2 provides the SDL3 subset
++    # this tree uses, on libnx. See platform/switch2/README.md.
++    set(CTR_NATIVE_SWITCH2 ON)
++elseif(NINTENDO_SWITCH)
++    message(FATAL_ERROR "Use the Switch 2 toolchain (libounce Switch2.cmake); Switch 1 is not supported.")
++endif()
++if(ANDROID OR IOS OR CTR_NATIVE_SWITCH2)
+     set(CTR_NATIVE_RENDERER_GLES_DEFAULT ON)
+ endif()
+ option(CTR_NATIVE_RENDERER_GLES
+@@ -181,6 +190,14 @@ function(ctr_native_add_label_warning_if_supported target warning flag_check)
+ endfunction()
+ 
+ # SDL3
++if(CTR_NATIVE_SWITCH2)
++    add_library(ctr_sdl3_switch2 STATIC platform/switch2/sdl3_switch2.c)
++    target_include_directories(ctr_sdl3_switch2 PUBLIC ${CMAKE_SOURCE_DIR}/externals/SDL/include)
++    target_compile_definitions(ctr_sdl3_switch2 PUBLIC CTR_NATIVE_SWITCH2=1)
++    set_target_properties(ctr_sdl3_switch2 PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
++    target_link_libraries(ctr_sdl3_switch2 PUBLIC EGL nx m)
++    add_library(SDL3::SDL3 ALIAS ctr_sdl3_switch2)
++else()
+ set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+ set(SDL_STATIC ON CACHE BOOL "" FORCE)
+ set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+@@ -202,6 +219,7 @@ set(SDL_SNDIO_SHARED OFF CACHE BOOL "" FORCE)
+ set(SDL_X11_XSCRNSAVER OFF CACHE BOOL "" FORCE)
+ set(SDL_X11_XTEST OFF CACHE BOOL "" FORCE)
+ add_subdirectory(externals/SDL)
++endif()
+ 
+ # CTR Native
+ set(CTR_NATIVE_EXECUTABLE_OPTIONS)
+@@ -272,6 +290,25 @@ set_target_properties(ctr_native PROPERTIES
+     C_EXTENSIONS OFF
+     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+ )
++if(CTR_NATIVE_SWITCH2)
++    # libnx headers need GNU extensions. The PS1 code assumes a signed char
++    # (MIPS, x86 and Apple arm64 all default to it; AArch64 ELF does not).
++    set_target_properties(ctr_native PROPERTIES C_EXTENSIONS ON OUTPUT_NAME "ctr-native")
++    target_compile_options(ctr_native PRIVATE -fsigned-char)
++    set(CTR_SWITCH2_NRO_NAME "CTR Native" CACHE STRING "Title shown in hbmenu")
++    set(CTR_SWITCH2_NRO_AUTHOR "CTR-tools, CTRPad, ctr-web" CACHE STRING "Author shown in hbmenu")
++    nx_generate_nacp(ctr-native.nacp
++        NAME "${CTR_SWITCH2_NRO_NAME}"
++        AUTHOR "${CTR_SWITCH2_NRO_AUTHOR}"
++        VERSION "${CTR_NATIVE_VERSION}"
++    )
++    set(CTR_SWITCH2_ICON "${CMAKE_SOURCE_DIR}/platform/switch2/icon.jpg")
++    if(EXISTS "${CTR_SWITCH2_ICON}")
++        nx_create_nro(ctr_native NACP ctr-native.nacp ICON "${CTR_SWITCH2_ICON}")
++    else()
++        nx_create_nro(ctr_native NACP ctr-native.nacp)
++    endif()
++endif()
+ if(CTR_NATIVE_MACOS_BUNDLE)
+     find_program(CTR_NATIVE_CODESIGN_EXECUTABLE codesign REQUIRED)
+     set(CTR_NATIVE_MACOS_ICON "${CMAKE_SOURCE_DIR}/platform/apple/CTRPad.icns")
+diff --git a/platform/native_glad.c b/platform/native_glad.c
+index 878d5b0c..9c13ff4c 100644
+--- a/platform/native_glad.c
++++ b/platform/native_glad.c
+@@ -85,6 +85,23 @@ internal void close_gl(void)
+ 		libGL = NULL;
+ 	}
+ }
++#elif defined(CTR_NATIVE_SWITCH2)
++// Switch 2: OunceVK is linked statically and the renderer loads GL through
++// SDL_GL_GetProcAddress (eglGetProcAddress); there is no library to open.
++global_variable void *libGL;
++typedef void *(APIENTRYP PFNGLXGETPROCADDRESSPROC_PRIVATE)(const char *);
++global_variable PFNGLXGETPROCADDRESSPROC_PRIVATE gladGetProcAddressPtr;
++#define dlsym(handle, name) ((void)(handle), (void)(name), (void *)NULL)
++
++internal int open_gl(void)
++{
++	return 0;
++}
++
++internal void close_gl(void)
++{
++	libGL = NULL;
++}
+ #else
+ #include <dlfcn.h>
+ global_variable void *libGL;
+diff --git a/platform/switch2/sdl3_switch2.c b/platform/switch2/sdl3_switch2.c
+new file mode 100644
+index 00000000..b6d5ca21
+--- /dev/null
++++ b/platform/switch2/sdl3_switch2.c
+@@ -0,0 +1,1580 @@
++// SPDX-License-Identifier: Zlib
++//
++// The subset of SDL3 that CTR Native uses, implemented on libounce (libnx for
++// Switch 2) and OunceVK's EGL. SDL3 has no Switch platform; rather than port a
++// whole SDL backend, this file implements exactly the calls the game's
++// platform layer makes, with SDL3's own headers (externals/SDL/include) for
++// the types, enums and scancode values, so the callers compile unchanged.
++//
++// Video:  EGL on the default NWindow, one fixed-size fullscreen window.
++// Input:  libnx pad, up to four players (player 1 also reads handheld mode).
++// Audio:  audren through libnx's audio driver; the renderer resamples the
++//         game's 44.1 kHz stream to 48 kHz.
++// Events: appletMainLoop (quit), controller connect/disconnect.
++#include <switch.h>
++
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <GLES3/gl3.h>
++
++#include <SDL3/SDL.h>
++
++#include <errno.h>
++#include <malloc.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++
++// ---------------------------------------------------------------------------
++// Errors, hints, memory, version
++
++static char s_error[256];
++
++bool SDL_SetError(SDL_PRINTF_FORMAT_STRING const char *fmt, ...)
++{
++	va_list ap;
++	va_start(ap, fmt);
++	vsnprintf(s_error, sizeof(s_error), fmt, ap);
++	va_end(ap);
++	return false;
++}
++
++const char *SDL_GetError(void)
++{
++	return s_error;
++}
++
++bool SDL_ClearError(void)
++{
++	s_error[0] = '\0';
++	return true;
++}
++
++#define SWITCH2_MAX_HINTS 32
++static struct
++{
++	char *name;
++	char *value;
++} s_hints[SWITCH2_MAX_HINTS];
++
++bool SDL_SetHint(const char *name, const char *value)
++{
++	int freeSlot = -1;
++	if (name == NULL)
++	{
++		return false;
++	}
++	for (int i = 0; i < SWITCH2_MAX_HINTS; i++)
++	{
++		if (s_hints[i].name == NULL)
++		{
++			if (freeSlot < 0)
++			{
++				freeSlot = i;
++			}
++			continue;
++		}
++		if (strcmp(s_hints[i].name, name) == 0)
++		{
++			free(s_hints[i].value);
++			s_hints[i].value = value ? strdup(value) : NULL;
++			return true;
++		}
++	}
++	if (freeSlot < 0)
++	{
++		return false;
++	}
++	s_hints[freeSlot].name = strdup(name);
++	s_hints[freeSlot].value = value ? strdup(value) : NULL;
++	return true;
++}
++
++const char *SDL_GetHint(const char *name)
++{
++	const char *env;
++	if (name == NULL)
++	{
++		return NULL;
++	}
++	env = getenv(name);
++	if (env != NULL)
++	{
++		return env;
++	}
++	for (int i = 0; i < SWITCH2_MAX_HINTS; i++)
++	{
++		if ((s_hints[i].name != NULL) && (strcmp(s_hints[i].name, name) == 0))
++		{
++			return s_hints[i].value;
++		}
++	}
++	return NULL;
++}
++
++void *SDL_malloc(size_t size)
++{
++	return malloc(size ? size : 1);
++}
++
++void *SDL_calloc(size_t nmemb, size_t size)
++{
++	return calloc(nmemb ? nmemb : 1, size ? size : 1);
++}
++
++void *SDL_realloc(void *mem, size_t size)
++{
++	return realloc(mem, size ? size : 1);
++}
++
++void SDL_free(void *mem)
++{
++	free(mem);
++}
++
++char *SDL_strdup(const char *str)
++{
++	return str ? strdup(str) : NULL;
++}
++
++int SDL_GetVersion(void)
++{
++	return SDL_VERSION;
++}
++
++const char *SDL_GetPlatform(void)
++{
++	return "Nintendo Switch 2";
++}
++
++// ---------------------------------------------------------------------------
++// Time
++
++Uint64 SDL_GetPerformanceCounter(void)
++{
++	return armGetSystemTick();
++}
++
++Uint64 SDL_GetPerformanceFrequency(void)
++{
++	return armGetSystemTickFreq();
++}
++
++Uint64 SDL_GetTicksNS(void)
++{
++	return armTicksToNs(armGetSystemTick());
++}
++
++Uint64 SDL_GetTicks(void)
++{
++	return SDL_GetTicksNS() / 1000000ull;
++}
++
++void SDL_DelayNS(Uint64 ns)
++{
++	svcSleepThread((s64)ns);
++}
++
++void SDL_Delay(Uint32 ms)
++{
++	svcSleepThread((s64)ms * 1000000ll);
++}
++
++void SDL_DelayPrecise(Uint64 ns)
++{
++	const u64 freq = armGetSystemTickFreq();
++	const u64 start = armGetSystemTick();
++	const u64 target = start + armNsToTicks(ns);
++	(void)freq;
++
++	// Horizon's sleep is tick-accurate but may wake up to a scheduler quantum
++	// late; sleep to ~0.5 ms before the target and yield the rest.
++	if (ns > 1000000ull)
++	{
++		svcSleepThread((s64)(ns - 500000ull));
++	}
++	while (armGetSystemTick() < target)
++	{
++		svcSleepThread(0);
++	}
++}
++
++// ---------------------------------------------------------------------------
++// Subsystems and events
++
++static SDL_InitFlags s_initFlags;
++static void Switch2_PadInit(void);
++static void Switch2_PadUpdate(void);
++
++bool SDL_Init(SDL_InitFlags flags)
++{
++	return SDL_InitSubSystem(flags);
++}
++
++bool SDL_InitSubSystem(SDL_InitFlags flags)
++{
++	if (flags & (SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK))
++	{
++		Switch2_PadInit();
++	}
++	s_initFlags |= flags;
++	return true;
++}
++
++void SDL_QuitSubSystem(SDL_InitFlags flags)
++{
++	s_initFlags &= ~flags;
++}
++
++SDL_InitFlags SDL_WasInit(SDL_InitFlags flags)
++{
++	return flags ? (s_initFlags & flags) : s_initFlags;
++}
++
++void SDL_Quit(void)
++{
++	s_initFlags = 0;
++}
++
++#define SWITCH2_EVENT_QUEUE 64
++static SDL_Event s_events[SWITCH2_EVENT_QUEUE];
++static int s_eventHead;
++static int s_eventCount;
++static bool s_quitSent;
++
++#define SWITCH2_MAX_WATCHES 4
++static struct
++{
++	SDL_EventFilter filter;
++	void *userdata;
++} s_watches[SWITCH2_MAX_WATCHES];
++
++bool SDL_AddEventWatch(SDL_EventFilter filter, void *userdata)
++{
++	for (int i = 0; i < SWITCH2_MAX_WATCHES; i++)
++	{
++		if (s_watches[i].filter == NULL)
++		{
++			s_watches[i].filter = filter;
++			s_watches[i].userdata = userdata;
++			return true;
++		}
++	}
++	return SDL_SetError("too many event watches");
++}
++
++void SDL_RemoveEventWatch(SDL_EventFilter filter, void *userdata)
++{
++	for (int i = 0; i < SWITCH2_MAX_WATCHES; i++)
++	{
++		if ((s_watches[i].filter == filter) && (s_watches[i].userdata == userdata))
++		{
++			s_watches[i].filter = NULL;
++			s_watches[i].userdata = NULL;
++		}
++	}
++}
++
++static void Switch2_PushEvent(const SDL_Event *event)
++{
++	SDL_Event copy = *event;
++	copy.common.timestamp = SDL_GetTicksNS();
++	for (int i = 0; i < SWITCH2_MAX_WATCHES; i++)
++	{
++		if (s_watches[i].filter != NULL)
++		{
++			s_watches[i].filter(s_watches[i].userdata, &copy);
++		}
++	}
++	if (s_eventCount >= SWITCH2_EVENT_QUEUE)
++	{
++		return;
++	}
++	s_events[(s_eventHead + s_eventCount) % SWITCH2_EVENT_QUEUE] = copy;
++	s_eventCount++;
++}
++
++void SDL_PumpEvents(void)
++{
++	if (!appletMainLoop() && !s_quitSent)
++	{
++		SDL_Event quit;
++		memset(&quit, 0, sizeof(quit));
++		quit.type = SDL_EVENT_QUIT;
++		s_quitSent = true;
++		Switch2_PushEvent(&quit);
++	}
++	Switch2_PadUpdate();
++}
++
++bool SDL_PollEvent(SDL_Event *event)
++{
++	if (s_eventCount == 0)
++	{
++		SDL_PumpEvents();
++	}
++	if (s_eventCount == 0)
++	{
++		return false;
++	}
++	if (event != NULL)
++	{
++		*event = s_events[s_eventHead];
++	}
++	s_eventHead = (s_eventHead + 1) % SWITCH2_EVENT_QUEUE;
++	s_eventCount--;
++	return true;
++}
++
++// ---------------------------------------------------------------------------
++// Video: EGL on the default NWindow
++
++struct SDL_Window
++{
++	int width;
++	int height;
++	SDL_WindowFlags flags;
++	EGLDisplay display;
++	EGLSurface surface;
++	EGLConfig config;
++};
++
++struct SDL_GLContextState
++{
++	EGLContext context;
++};
++
++static int s_glAttributes[SDL_GL_EGL_PLATFORM + 1];
++static bool s_glAttributesSet;
++
++static void Switch2_DefaultGLAttributes(void)
++{
++	if (s_glAttributesSet)
++	{
++		return;
++	}
++	s_glAttributesSet = true;
++	s_glAttributes[SDL_GL_RED_SIZE] = 8;
++	s_glAttributes[SDL_GL_GREEN_SIZE] = 8;
++	s_glAttributes[SDL_GL_BLUE_SIZE] = 8;
++	s_glAttributes[SDL_GL_ALPHA_SIZE] = 8;
++	s_glAttributes[SDL_GL_DOUBLEBUFFER] = 1;
++	s_glAttributes[SDL_GL_CONTEXT_MAJOR_VERSION] = 3;
++	s_glAttributes[SDL_GL_CONTEXT_MINOR_VERSION] = 0;
++	s_glAttributes[SDL_GL_CONTEXT_PROFILE_MASK] = SDL_GL_CONTEXT_PROFILE_ES;
++}
++
++bool SDL_GL_SetAttribute(SDL_GLAttr attr, int value)
++{
++	Switch2_DefaultGLAttributes();
++	if (((int)attr < 0) || ((int)attr >= (int)SDL_arraysize(s_glAttributes)))
++	{
++		return SDL_SetError("unsupported GL attribute %d", (int)attr);
++	}
++	s_glAttributes[attr] = value;
++	return true;
++}
++
++bool SDL_GL_GetAttribute(SDL_GLAttr attr, int *value)
++{
++	Switch2_DefaultGLAttributes();
++	if ((value == NULL) || ((int)attr < 0) || ((int)attr >= (int)SDL_arraysize(s_glAttributes)))
++	{
++		return SDL_SetError("unsupported GL attribute");
++	}
++	*value = s_glAttributes[attr];
++	return true;
++}
++
++static SDL_Window *s_window;
++static SDL_GLContext s_currentContext;
++
++#ifndef CTR_SWITCH2_WIDTH
++#define CTR_SWITCH2_WIDTH 1920
++#endif
++#ifndef CTR_SWITCH2_HEIGHT
++#define CTR_SWITCH2_HEIGHT 1080
++#endif
++
++SDL_Window *SDL_CreateWindow(const char *title, int w, int h, SDL_WindowFlags flags)
++{
++	NWindow *nw = nwindowGetDefault();
++	u32 width = CTR_SWITCH2_WIDTH;
++	u32 height = CTR_SWITCH2_HEIGHT;
++	Result rc;
++
++	(void)title;
++	(void)w;
++	(void)h;
++	if (s_window != NULL)
++	{
++		SDL_SetError("only one window is supported");
++		return NULL;
++	}
++
++	// One size for both modes: the game draws into its own internal target
++	// and scales to the window, and a fixed size means no swapchain resize.
++	rc = nwindowSetModeDimensions(nw, width, height, width, height);
++	if (R_FAILED(rc))
++	{
++		fprintf(stderr, "[Switch2] nwindowSetModeDimensions failed: 0x%x\n", rc);
++	}
++	if (R_FAILED(nwindowGetDimensions(nw, &width, &height)) || (width == 0) || (height == 0))
++	{
++		width = CTR_SWITCH2_WIDTH;
++		height = CTR_SWITCH2_HEIGHT;
++	}
++
++	s_window = (SDL_Window *)calloc(1, sizeof(*s_window));
++	if (s_window == NULL)
++	{
++		SDL_SetError("out of memory");
++		return NULL;
++	}
++	s_window->width = (int)width;
++	s_window->height = (int)height;
++	s_window->flags = flags | SDL_WINDOW_FULLSCREEN | SDL_WINDOW_OPENGL | SDL_WINDOW_INPUT_FOCUS | SDL_WINDOW_MOUSE_FOCUS;
++	s_window->flags &= ~(SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN);
++	s_window->display = EGL_NO_DISPLAY;
++	s_window->surface = EGL_NO_SURFACE;
++	printf("[Switch2] window %ux%u\n", width, height);
++	return s_window;
++}
++
++void SDL_DestroyWindow(SDL_Window *window)
++{
++	if ((window == NULL) || (window != s_window))
++	{
++		return;
++	}
++	if (window->display != EGL_NO_DISPLAY)
++	{
++		eglMakeCurrent(window->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++		if (window->surface != EGL_NO_SURFACE)
++		{
++			eglDestroySurface(window->display, window->surface);
++		}
++		eglTerminate(window->display);
++	}
++	free(window);
++	s_window = NULL;
++	s_currentContext = NULL;
++}
++
++bool SDL_SetWindowTitle(SDL_Window *window, const char *title)
++{
++	(void)window;
++	(void)title;
++	return true;
++}
++
++SDL_WindowFlags SDL_GetWindowFlags(SDL_Window *window)
++{
++	return window ? window->flags : 0;
++}
++
++bool SDL_SetWindowFullscreen(SDL_Window *window, bool fullscreen)
++{
++	(void)window;
++	(void)fullscreen;
++	return true;
++}
++
++bool SDL_GetWindowSize(SDL_Window *window, int *w, int *h)
++{
++	if (window == NULL)
++	{
++		return SDL_SetError("no window");
++	}
++	if (w)
++	{
++		*w = window->width;
++	}
++	if (h)
++	{
++		*h = window->height;
++	}
++	return true;
++}
++
++bool SDL_GetWindowSizeInPixels(SDL_Window *window, int *w, int *h)
++{
++	return SDL_GetWindowSize(window, w, h);
++}
++
++SDL_PropertiesID SDL_GetWindowProperties(SDL_Window *window)
++{
++	(void)window;
++	return 0;
++}
++
++Sint64 SDL_GetNumberProperty(SDL_PropertiesID props, const char *name, Sint64 default_value)
++{
++	(void)props;
++	(void)name;
++	return default_value;
++}
++
++bool SDL_ShowCursor(void)
++{
++	return true;
++}
++
++bool SDL_HideCursor(void)
++{
++	return true;
++}
++
++SDL_GLContext SDL_GL_CreateContext(SDL_Window *window)
++{
++	const bool es = s_glAttributes[SDL_GL_CONTEXT_PROFILE_MASK] == SDL_GL_CONTEXT_PROFILE_ES;
++	EGLint configCount = 0;
++	EGLint configAttributes[32];
++	EGLint contextAttributes[16];
++	int n = 0;
++	SDL_GLContext context;
++
++	Switch2_DefaultGLAttributes();
++	if (window == NULL)
++	{
++		SDL_SetError("no window");
++		return NULL;
++	}
++
++	if (window->display == EGL_NO_DISPLAY)
++	{
++		window->display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++		if ((window->display == EGL_NO_DISPLAY) || !eglInitialize(window->display, NULL, NULL))
++		{
++			SDL_SetError("eglInitialize failed: 0x%x", eglGetError());
++			window->display = EGL_NO_DISPLAY;
++			return NULL;
++		}
++	}
++	if (!eglBindAPI(es ? EGL_OPENGL_ES_API : EGL_OPENGL_API))
++	{
++		SDL_SetError("eglBindAPI failed: 0x%x", eglGetError());
++		return NULL;
++	}
++
++	if (window->surface == EGL_NO_SURFACE)
++	{
++		configAttributes[n++] = EGL_RENDERABLE_TYPE;
++		configAttributes[n++] = es ? EGL_OPENGL_ES3_BIT : EGL_OPENGL_BIT;
++		configAttributes[n++] = EGL_RED_SIZE;
++		configAttributes[n++] = s_glAttributes[SDL_GL_RED_SIZE];
++		configAttributes[n++] = EGL_GREEN_SIZE;
++		configAttributes[n++] = s_glAttributes[SDL_GL_GREEN_SIZE];
++		configAttributes[n++] = EGL_BLUE_SIZE;
++		configAttributes[n++] = s_glAttributes[SDL_GL_BLUE_SIZE];
++		configAttributes[n++] = EGL_ALPHA_SIZE;
++		configAttributes[n++] = s_glAttributes[SDL_GL_ALPHA_SIZE];
++		configAttributes[n++] = EGL_DEPTH_SIZE;
++		configAttributes[n++] = s_glAttributes[SDL_GL_DEPTH_SIZE];
++		configAttributes[n++] = EGL_STENCIL_SIZE;
++		configAttributes[n++] = s_glAttributes[SDL_GL_STENCIL_SIZE];
++		configAttributes[n++] = EGL_NONE;
++
++		if (!eglChooseConfig(window->display, configAttributes, &window->config, 1, &configCount) || (configCount == 0))
++		{
++			SDL_SetError("eglChooseConfig failed: 0x%x", eglGetError());
++			return NULL;
++		}
++		window->surface = eglCreateWindowSurface(window->display, window->config, (EGLNativeWindowType)nwindowGetDefault(), NULL);
++		if (window->surface == EGL_NO_SURFACE)
++		{
++			SDL_SetError("eglCreateWindowSurface failed: 0x%x", eglGetError());
++			return NULL;
++		}
++	}
++
++	n = 0;
++	contextAttributes[n++] = EGL_CONTEXT_MAJOR_VERSION;
++	contextAttributes[n++] = s_glAttributes[SDL_GL_CONTEXT_MAJOR_VERSION];
++	contextAttributes[n++] = EGL_CONTEXT_MINOR_VERSION;
++	contextAttributes[n++] = s_glAttributes[SDL_GL_CONTEXT_MINOR_VERSION];
++	if (!es)
++	{
++		contextAttributes[n++] = EGL_CONTEXT_OPENGL_PROFILE_MASK;
++		contextAttributes[n++] = (s_glAttributes[SDL_GL_CONTEXT_PROFILE_MASK] == SDL_GL_CONTEXT_PROFILE_COMPATIBILITY)
++		                             ? EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT
++		                             : EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT;
++	}
++	contextAttributes[n++] = EGL_NONE;
++
++	context = (SDL_GLContext)calloc(1, sizeof(*context));
++	if (context == NULL)
++	{
++		SDL_SetError("out of memory");
++		return NULL;
++	}
++	context->context = eglCreateContext(window->display, window->config, EGL_NO_CONTEXT, contextAttributes);
++	if (context->context == EGL_NO_CONTEXT)
++	{
++		SDL_SetError("eglCreateContext %s %d.%d failed: 0x%x", es ? "ES" : "GL", s_glAttributes[SDL_GL_CONTEXT_MAJOR_VERSION],
++		             s_glAttributes[SDL_GL_CONTEXT_MINOR_VERSION], eglGetError());
++		free(context);
++		return NULL;
++	}
++	if (!eglMakeCurrent(window->display, window->surface, window->surface, context->context))
++	{
++		SDL_SetError("eglMakeCurrent failed: 0x%x", eglGetError());
++		eglDestroyContext(window->display, context->context);
++		free(context);
++		return NULL;
++	}
++	s_currentContext = context;
++	printf("[Switch2] GL_RENDERER=%s GL_VERSION=%s\n", (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
++	return context;
++}
++
++bool SDL_GL_MakeCurrent(SDL_Window *window, SDL_GLContext context)
++{
++	if ((window == NULL) || (window->display == EGL_NO_DISPLAY))
++	{
++		return SDL_SetError("no window");
++	}
++	if (context == NULL)
++	{
++		eglMakeCurrent(window->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++		s_currentContext = NULL;
++		return true;
++	}
++	if (!eglMakeCurrent(window->display, window->surface, window->surface, context->context))
++	{
++		return SDL_SetError("eglMakeCurrent failed: 0x%x", eglGetError());
++	}
++	s_currentContext = context;
++	return true;
++}
++
++SDL_GLContext SDL_GL_GetCurrentContext(void)
++{
++	return s_currentContext;
++}
++
++bool SDL_GL_DestroyContext(SDL_GLContext context)
++{
++	if (context == NULL)
++	{
++		return true;
++	}
++	if ((s_window != NULL) && (s_window->display != EGL_NO_DISPLAY))
++	{
++		if (s_currentContext == context)
++		{
++			eglMakeCurrent(s_window->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++			s_currentContext = NULL;
++		}
++		eglDestroyContext(s_window->display, context->context);
++	}
++	free(context);
++	return true;
++}
++
++SDL_FunctionPointer SDL_GL_GetProcAddress(const char *proc)
++{
++	return (SDL_FunctionPointer)eglGetProcAddress(proc);
++}
++
++bool SDL_GL_ExtensionSupported(const char *extension)
++{
++	GLint count = 0;
++	if ((extension == NULL) || (s_currentContext == NULL))
++	{
++		return false;
++	}
++	glGetIntegerv(GL_NUM_EXTENSIONS, &count);
++	for (GLint i = 0; i < count; i++)
++	{
++		const char *name = (const char *)glGetStringi(GL_EXTENSIONS, (GLuint)i);
++		if ((name != NULL) && (strcmp(name, extension) == 0))
++		{
++			return true;
++		}
++	}
++	return false;
++}
++
++bool SDL_GL_SetSwapInterval(int interval)
++{
++	if ((s_window == NULL) || (s_window->display == EGL_NO_DISPLAY))
++	{
++		return SDL_SetError("no window");
++	}
++	return eglSwapInterval(s_window->display, interval < 0 ? 1 : interval) ? true : SDL_SetError("eglSwapInterval failed");
++}
++
++bool SDL_GL_SwapWindow(SDL_Window *window)
++{
++	if ((window == NULL) || (window->surface == EGL_NO_SURFACE))
++	{
++		return SDL_SetError("no surface");
++	}
++	if (!eglSwapBuffers(window->display, window->surface))
++	{
++		return SDL_SetError("eglSwapBuffers failed: 0x%x", eglGetError());
++	}
++	return true;
++}
++
++// Screenshots and debug probes write BMPs through SDL surfaces; not offered.
++SDL_Surface *SDL_CreateSurfaceFrom(int width, int height, SDL_PixelFormat format, void *pixels, int pitch)
++{
++	(void)width;
++	(void)height;
++	(void)format;
++	(void)pixels;
++	(void)pitch;
++	SDL_SetError("surfaces are not supported on Switch 2");
++	return NULL;
++}
++
++void SDL_DestroySurface(SDL_Surface *surface)
++{
++	(void)surface;
++}
++
++bool SDL_SaveBMP(SDL_Surface *surface, const char *file)
++{
++	(void)surface;
++	(void)file;
++	return SDL_SetError("SDL_SaveBMP is not supported on Switch 2");
++}
++
++// ---------------------------------------------------------------------------
++// Keyboard and mouse: none. The state array stays released.
++
++static bool s_keyboardState[SDL_SCANCODE_COUNT];
++
++const bool *SDL_GetKeyboardState(int *numkeys)
++{
++	if (numkeys)
++	{
++		*numkeys = SDL_SCANCODE_COUNT;
++	}
++	return s_keyboardState;
++}
++
++// ---------------------------------------------------------------------------
++// Gamepads: libnx pad. Joystick IDs 1..4 are players 1..4.
++
++#define SWITCH2_MAX_PADS 4
++
++struct SDL_Gamepad
++{
++	SDL_JoystickID id;
++};
++
++static bool s_padInitialized;
++static PadState s_pads[SWITCH2_MAX_PADS];
++static bool s_padConnected[SWITCH2_MAX_PADS];
++static struct SDL_Gamepad s_gamepads[SWITCH2_MAX_PADS];
++static HidVibrationDeviceHandle s_vibration[SWITCH2_MAX_PADS][2];
++static bool s_vibrationReady[SWITCH2_MAX_PADS];
++
++static void Switch2_PadInit(void)
++{
++	if (s_padInitialized)
++	{
++		return;
++	}
++	s_padInitialized = true;
++	padConfigureInput(SWITCH2_MAX_PADS, HidNpadStyleSet_NpadStandard);
++	padInitialize(&s_pads[0], HidNpadIdType_No1, HidNpadIdType_Handheld);
++	padInitialize(&s_pads[1], HidNpadIdType_No2);
++	padInitialize(&s_pads[2], HidNpadIdType_No3);
++	padInitialize(&s_pads[3], HidNpadIdType_No4);
++	for (int i = 0; i < SWITCH2_MAX_PADS; i++)
++	{
++		s_gamepads[i].id = (SDL_JoystickID)(i + 1);
++		padUpdate(&s_pads[i]);
++		s_padConnected[i] = padIsConnected(&s_pads[i]);
++	}
++}
++
++static void Switch2_PadUpdate(void)
++{
++	if (!s_padInitialized)
++	{
++		return;
++	}
++	for (int i = 0; i < SWITCH2_MAX_PADS; i++)
++	{
++		bool connected;
++		padUpdate(&s_pads[i]);
++		connected = padIsConnected(&s_pads[i]);
++		if (connected != s_padConnected[i])
++		{
++			SDL_Event event;
++			memset(&event, 0, sizeof(event));
++			event.type = connected ? SDL_EVENT_GAMEPAD_ADDED : SDL_EVENT_GAMEPAD_REMOVED;
++			event.gdevice.which = (SDL_JoystickID)(i + 1);
++			s_padConnected[i] = connected;
++			s_vibrationReady[i] = false;
++			Switch2_PushEvent(&event);
++		}
++	}
++}
++
++static int Switch2_PadIndex(SDL_JoystickID id)
++{
++	return ((id >= 1) && (id <= SWITCH2_MAX_PADS)) ? (int)id - 1 : -1;
++}
++
++void SDL_UpdateJoysticks(void)
++{
++	Switch2_PadUpdate();
++}
++
++SDL_JoystickID *SDL_GetGamepads(int *count)
++{
++	SDL_JoystickID *ids = (SDL_JoystickID *)calloc(SWITCH2_MAX_PADS + 1, sizeof(SDL_JoystickID));
++	int n = 0;
++	Switch2_PadInit();
++	if (ids != NULL)
++	{
++		for (int i = 0; i < SWITCH2_MAX_PADS; i++)
++		{
++			if (s_padConnected[i])
++			{
++				ids[n++] = (SDL_JoystickID)(i + 1);
++			}
++		}
++	}
++	if (count)
++	{
++		*count = n;
++	}
++	return ids;
++}
++
++bool SDL_IsGamepad(SDL_JoystickID instance_id)
++{
++	return Switch2_PadIndex(instance_id) >= 0;
++}
++
++bool SDL_IsJoystickVirtual(SDL_JoystickID instance_id)
++{
++	(void)instance_id;
++	return false;
++}
++
++SDL_Gamepad *SDL_OpenGamepad(SDL_JoystickID instance_id)
++{
++	const int index = Switch2_PadIndex(instance_id);
++	if (index < 0)
++	{
++		SDL_SetError("invalid gamepad %u", (unsigned)instance_id);
++		return NULL;
++	}
++	Switch2_PadInit();
++	return &s_gamepads[index];
++}
++
++void SDL_CloseGamepad(SDL_Gamepad *gamepad)
++{
++	(void)gamepad;
++}
++
++SDL_Joystick *SDL_GetGamepadJoystick(SDL_Gamepad *gamepad)
++{
++	return (SDL_Joystick *)gamepad;
++}
++
++SDL_JoystickID SDL_GetJoystickID(SDL_Joystick *joystick)
++{
++	return joystick ? ((SDL_Gamepad *)joystick)->id : 0;
++}
++
++bool SDL_GamepadConnected(SDL_Gamepad *gamepad)
++{
++	const int index = gamepad ? Switch2_PadIndex(gamepad->id) : -1;
++	return (index >= 0) && s_padConnected[index];
++}
++
++const char *SDL_GetGamepadName(SDL_Gamepad *gamepad)
++{
++	const int index = gamepad ? Switch2_PadIndex(gamepad->id) : -1;
++	if (index < 0)
++	{
++		return NULL;
++	}
++	if ((index == 0) && (padGetStyleSet(&s_pads[0]) & HidNpadStyleTag_NpadHandheld))
++	{
++		return "Switch 2 handheld";
++	}
++	return "Switch 2 controller";
++}
++
++bool SDL_GetGamepadButton(SDL_Gamepad *gamepad, SDL_GamepadButton button)
++{
++	const int index = gamepad ? Switch2_PadIndex(gamepad->id) : -1;
++	u64 held;
++	u64 mask = 0;
++
++	if ((index < 0) || !s_padConnected[index])
++	{
++		return false;
++	}
++	held = padGetButtons(&s_pads[index]);
++
++	// SDL's buttons are positional: SOUTH is the bottom face button (B on a
++	// Nintendo pad), which the game maps to the PlayStation's Cross.
++	switch (button)
++	{
++	case SDL_GAMEPAD_BUTTON_SOUTH: mask = HidNpadButton_B; break;
++	case SDL_GAMEPAD_BUTTON_EAST: mask = HidNpadButton_A; break;
++	case SDL_GAMEPAD_BUTTON_WEST: mask = HidNpadButton_Y; break;
++	case SDL_GAMEPAD_BUTTON_NORTH: mask = HidNpadButton_X; break;
++	case SDL_GAMEPAD_BUTTON_BACK: mask = HidNpadButton_Minus; break;
++	case SDL_GAMEPAD_BUTTON_START: mask = HidNpadButton_Plus; break;
++	case SDL_GAMEPAD_BUTTON_LEFT_STICK: mask = HidNpadButton_StickL; break;
++	case SDL_GAMEPAD_BUTTON_RIGHT_STICK: mask = HidNpadButton_StickR; break;
++	case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: mask = HidNpadButton_L; break;
++	case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: mask = HidNpadButton_R; break;
++	case SDL_GAMEPAD_BUTTON_DPAD_UP: mask = HidNpadButton_Up; break;
++	case SDL_GAMEPAD_BUTTON_DPAD_DOWN: mask = HidNpadButton_Down; break;
++	case SDL_GAMEPAD_BUTTON_DPAD_LEFT: mask = HidNpadButton_Left; break;
++	case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: mask = HidNpadButton_Right; break;
++	default: return false;
++	}
++	return (held & mask) != 0;
++}
++
++Sint16 SDL_GetGamepadAxis(SDL_Gamepad *gamepad, SDL_GamepadAxis axis)
++{
++	const int index = gamepad ? Switch2_PadIndex(gamepad->id) : -1;
++	HidAnalogStickState stick;
++	int value;
++
++	if ((index < 0) || !s_padConnected[index])
++	{
++		return 0;
++	}
++
++	switch (axis)
++	{
++	case SDL_GAMEPAD_AXIS_LEFTX:
++	case SDL_GAMEPAD_AXIS_LEFTY:
++	case SDL_GAMEPAD_AXIS_RIGHTX:
++	case SDL_GAMEPAD_AXIS_RIGHTY:
++		stick = padGetStickPos(&s_pads[index], (axis == SDL_GAMEPAD_AXIS_LEFTX || axis == SDL_GAMEPAD_AXIS_LEFTY) ? 0 : 1);
++		// libnx reports up as positive; SDL reports down as positive.
++		value = (axis == SDL_GAMEPAD_AXIS_LEFTX || axis == SDL_GAMEPAD_AXIS_RIGHTX) ? stick.x : -stick.y;
++		if (value > 32767)
++		{
++			value = 32767;
++		}
++		if (value < -32768)
++		{
++			value = -32768;
++		}
++		return (Sint16)value;
++	case SDL_GAMEPAD_AXIS_LEFT_TRIGGER:
++		return (padGetButtons(&s_pads[index]) & HidNpadButton_ZL) ? 32767 : 0;
++	case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER:
++		return (padGetButtons(&s_pads[index]) & HidNpadButton_ZR) ? 32767 : 0;
++	default:
++		return 0;
++	}
++}
++
++static bool Switch2_PrepareVibration(int index)
++{
++	HidNpadIdType id;
++	HidNpadStyleTag style;
++	u32 styleSet;
++
++	if (s_vibrationReady[index])
++	{
++		return true;
++	}
++	styleSet = padGetStyleSet(&s_pads[index]);
++	if ((index == 0) && (styleSet & HidNpadStyleTag_NpadHandheld))
++	{
++		id = HidNpadIdType_Handheld;
++		style = HidNpadStyleTag_NpadHandheld;
++	}
++	else
++	{
++		id = (HidNpadIdType)(HidNpadIdType_No1 + index);
++		if (styleSet & HidNpadStyleTag_NpadFullKey)
++		{
++			style = HidNpadStyleTag_NpadFullKey;
++		}
++		else
++		{
++			style = HidNpadStyleTag_NpadJoyDual;
++		}
++	}
++	if (R_FAILED(hidInitializeVibrationDevices(s_vibration[index], 2, id, style)))
++	{
++		return false;
++	}
++	s_vibrationReady[index] = true;
++	return true;
++}
++
++bool SDL_RumbleGamepad(SDL_Gamepad *gamepad, Uint16 low_frequency_rumble, Uint16 high_frequency_rumble, Uint32 duration_ms)
++{
++	const int index = gamepad ? Switch2_PadIndex(gamepad->id) : -1;
++	HidVibrationValue values[2];
++	float low = (float)low_frequency_rumble / 65535.0f;
++	float high = (float)high_frequency_rumble / 65535.0f;
++
++	(void)duration_ms; // the game sends a new value (or zero) every frame
++	if ((index < 0) || !s_padConnected[index] || !Switch2_PrepareVibration(index))
++	{
++		return false;
++	}
++	for (int i = 0; i < 2; i++)
++	{
++		values[i].amp_low = low;
++		values[i].freq_low = 160.0f;
++		values[i].amp_high = high;
++		values[i].freq_high = 320.0f;
++	}
++	return R_SUCCEEDED(hidSendVibrationValues(s_vibration[index], values, 2));
++}
++
++int SDL_AddGamepadMappingsFromFile(const char *file)
++{
++	(void)file;
++	return -1;
++}
++
++// Virtual joysticks only back a desktop self-test.
++SDL_JoystickID SDL_AttachVirtualJoystick(const SDL_VirtualJoystickDesc *desc)
++{
++	(void)desc;
++	SDL_SetError("virtual joysticks are not supported on Switch 2");
++	return 0;
++}
++
++bool SDL_DetachVirtualJoystick(SDL_JoystickID instance_id)
++{
++	(void)instance_id;
++	return false;
++}
++
++bool SDL_SetJoystickVirtualAxis(SDL_Joystick *joystick, int axis, Sint16 value)
++{
++	(void)joystick;
++	(void)axis;
++	(void)value;
++	return false;
++}
++
++bool SDL_SetJoystickVirtualButton(SDL_Joystick *joystick, int button, bool down)
++{
++	(void)joystick;
++	(void)button;
++	(void)down;
++	return false;
++}
++
++// ---------------------------------------------------------------------------
++// Audio: one stream, pulled by a thread that feeds audren wave buffers.
++
++#define SWITCH2_AUDIO_BUFFERS       4
++#define SWITCH2_AUDIO_BUFFER_FRAMES 1024
++#define SWITCH2_AUDIO_QUEUE_BYTES   (64 * 1024)
++
++struct SDL_AudioStream
++{
++	SDL_AudioSpec spec;
++	SDL_AudioStreamCallback callback;
++	void *userdata;
++	RMutex lock;
++	u8 *queue;
++	int queueHead;
++	int queueBytes;
++	volatile bool paused;
++	volatile bool running;
++	Thread thread;
++	bool threadStarted;
++	AudioDriver driver;
++	bool audrenReady;
++	bool driverReady;
++	void *pool;
++	size_t poolSize;
++	AudioDriverWaveBuf waveBufs[SWITCH2_AUDIO_BUFFERS];
++	int frameBytes;
++};
++
++static const AudioRendererConfig s_audioConfig = {
++	.output_rate = AudioRendererOutputRate_48kHz,
++	.num_voices = 2,
++	.num_effects = 0,
++	.num_sinks = 1,
++	.num_mix_objs = 1,
++	.num_mix_buffers = 2,
++};
++
++static int Switch2_AudioTake(SDL_AudioStream *stream, u8 *dst, int bytes)
++{
++	int taken = 0;
++	while ((taken < bytes) && (stream->queueBytes > 0))
++	{
++		int chunk = SWITCH2_AUDIO_QUEUE_BYTES - stream->queueHead;
++		if (chunk > stream->queueBytes)
++		{
++			chunk = stream->queueBytes;
++		}
++		if (chunk > bytes - taken)
++		{
++			chunk = bytes - taken;
++		}
++		memcpy(dst + taken, stream->queue + stream->queueHead, (size_t)chunk);
++		stream->queueHead = (stream->queueHead + chunk) % SWITCH2_AUDIO_QUEUE_BYTES;
++		stream->queueBytes -= chunk;
++		taken += chunk;
++	}
++	return taken;
++}
++
++static void Switch2_AudioFill(SDL_AudioStream *stream, u8 *dst, int bytes)
++{
++	int got = 0;
++	rmutexLock(&stream->lock);
++	if (!stream->paused && (stream->callback != NULL))
++	{
++		int guard = 8;
++		while ((stream->queueBytes < bytes) && (guard-- > 0))
++		{
++			const int before = stream->queueBytes;
++			stream->callback(stream->userdata, stream, bytes - stream->queueBytes, bytes);
++			if (stream->queueBytes == before)
++			{
++				break;
++			}
++		}
++	}
++	if (!stream->paused)
++	{
++		got = Switch2_AudioTake(stream, dst, bytes);
++	}
++	rmutexUnlock(&stream->lock);
++	if (got < bytes)
++	{
++		memset(dst + got, 0, (size_t)(bytes - got));
++	}
++}
++
++static void Switch2_AudioThread(void *arg)
++{
++	SDL_AudioStream *stream = (SDL_AudioStream *)arg;
++	const int bufferBytes = SWITCH2_AUDIO_BUFFER_FRAMES * stream->frameBytes;
++	bool started = false;
++
++	while (stream->running)
++	{
++		for (int i = 0; i < SWITCH2_AUDIO_BUFFERS; i++)
++		{
++			AudioDriverWaveBuf *wb = &stream->waveBufs[i];
++			if ((wb->state == AudioDriverWaveBufState_Free) || (wb->state == AudioDriverWaveBufState_Done))
++			{
++				u8 *data = (u8 *)stream->pool + (size_t)i * (size_t)bufferBytes;
++				Switch2_AudioFill(stream, data, bufferBytes);
++				armDCacheFlush(data, (size_t)bufferBytes);
++				audrvVoiceAddWaveBuf(&stream->driver, 0, wb);
++			}
++		}
++		if (!started || !audrvVoiceIsPlaying(&stream->driver, 0))
++		{
++			audrvVoiceStart(&stream->driver, 0);
++			started = true;
++		}
++		audrvUpdate(&stream->driver);
++		audrenWaitFrame();
++	}
++}
++
++static void Switch2_AudioClose(SDL_AudioStream *stream)
++{
++	if (stream->threadStarted)
++	{
++		stream->running = false;
++		threadWaitForExit(&stream->thread);
++		threadClose(&stream->thread);
++		stream->threadStarted = false;
++	}
++	if (stream->driverReady)
++	{
++		audrvVoiceStop(&stream->driver, 0);
++		audrvUpdate(&stream->driver);
++		audrvClose(&stream->driver);
++		stream->driverReady = false;
++	}
++	if (stream->audrenReady)
++	{
++		audrenExit();
++		stream->audrenReady = false;
++	}
++	free(stream->pool);
++	stream->pool = NULL;
++	free(stream->queue);
++	stream->queue = NULL;
++}
++
++SDL_AudioStream *SDL_OpenAudioDeviceStream(SDL_AudioDeviceID devid, const SDL_AudioSpec *spec, SDL_AudioStreamCallback callback, void *userdata)
++{
++	static const u8 sinkChannels[2] = {0, 1};
++	SDL_AudioStream *stream;
++	Result rc;
++	int bufferBytes;
++	int mempool;
++
++	(void)devid;
++	if ((spec == NULL) || (spec->format != SDL_AUDIO_S16) || (spec->channels < 1) || (spec->channels > 2) || (spec->freq <= 0))
++	{
++		SDL_SetError("unsupported audio format");
++		return NULL;
++	}
++
++	stream = (SDL_AudioStream *)calloc(1, sizeof(*stream));
++	if (stream == NULL)
++	{
++		SDL_SetError("out of memory");
++		return NULL;
++	}
++	stream->spec = *spec;
++	stream->callback = callback;
++	stream->userdata = userdata;
++	stream->paused = true; // SDL3 opens device streams paused
++	stream->frameBytes = (int)sizeof(s16) * spec->channels;
++	rmutexInit(&stream->lock);
++	stream->queue = (u8 *)malloc(SWITCH2_AUDIO_QUEUE_BYTES);
++
++	bufferBytes = SWITCH2_AUDIO_BUFFER_FRAMES * stream->frameBytes;
++	stream->poolSize = ((size_t)bufferBytes * SWITCH2_AUDIO_BUFFERS + (AUDREN_MEMPOOL_ALIGNMENT - 1)) & ~(size_t)(AUDREN_MEMPOOL_ALIGNMENT - 1);
++	stream->pool = memalign(AUDREN_MEMPOOL_ALIGNMENT, stream->poolSize);
++	if ((stream->queue == NULL) || (stream->pool == NULL))
++	{
++		SDL_SetError("out of memory");
++		Switch2_AudioClose(stream);
++		free(stream);
++		return NULL;
++	}
++	memset(stream->pool, 0, stream->poolSize);
++	armDCacheFlush(stream->pool, stream->poolSize);
++
++	rc = audrenInitialize(&s_audioConfig);
++	if (R_FAILED(rc))
++	{
++		SDL_SetError("audrenInitialize failed: 0x%x", rc);
++		Switch2_AudioClose(stream);
++		free(stream);
++		return NULL;
++	}
++	stream->audrenReady = true;
++
++	rc = audrvCreate(&stream->driver, &s_audioConfig, 2);
++	if (R_FAILED(rc))
++	{
++		SDL_SetError("audrvCreate failed: 0x%x", rc);
++		Switch2_AudioClose(stream);
++		free(stream);
++		return NULL;
++	}
++	stream->driverReady = true;
++
++	mempool = audrvMemPoolAdd(&stream->driver, stream->pool, stream->poolSize);
++	audrvMemPoolAttach(&stream->driver, mempool);
++	audrvDeviceSinkAdd(&stream->driver, AUDREN_DEFAULT_DEVICE_NAME, 2, sinkChannels);
++	rc = audrvUpdate(&stream->driver);
++	if (R_SUCCEEDED(rc))
++	{
++		rc = audrenStartAudioRenderer();
++	}
++	if (R_FAILED(rc) || !audrvVoiceInit(&stream->driver, 0, spec->channels, PcmFormat_Int16, spec->freq))
++	{
++		SDL_SetError("audio renderer start failed: 0x%x", rc);
++		Switch2_AudioClose(stream);
++		free(stream);
++		return NULL;
++	}
++	audrvVoiceSetDestinationMix(&stream->driver, 0, AUDREN_FINAL_MIX_ID);
++	if (spec->channels == 2)
++	{
++		audrvVoiceSetMixFactor(&stream->driver, 0, 1.0f, 0, 0);
++		audrvVoiceSetMixFactor(&stream->driver, 0, 0.0f, 0, 1);
++		audrvVoiceSetMixFactor(&stream->driver, 0, 0.0f, 1, 0);
++		audrvVoiceSetMixFactor(&stream->driver, 0, 1.0f, 1, 1);
++	}
++	else
++	{
++		audrvVoiceSetMixFactor(&stream->driver, 0, 1.0f, 0, 0);
++		audrvVoiceSetMixFactor(&stream->driver, 0, 1.0f, 0, 1);
++	}
++
++	for (int i = 0; i < SWITCH2_AUDIO_BUFFERS; i++)
++	{
++		AudioDriverWaveBuf *wb = &stream->waveBufs[i];
++		// One wave buffer per 4 KiB slice of the pool; offsets are in frames.
++		wb->data_raw = (u8 *)stream->pool + (size_t)i * (size_t)bufferBytes;
++		wb->size = (u64)bufferBytes;
++		wb->start_sample_offset = 0;
++		wb->end_sample_offset = SWITCH2_AUDIO_BUFFER_FRAMES;
++		wb->state = AudioDriverWaveBufState_Free;
++	}
++
++	stream->running = true;
++	// Core 2 keeps mixing away from the game thread (core 0 by default).
++	rc = threadCreate(&stream->thread, Switch2_AudioThread, stream, NULL, 0x10000, 0x2B, 2);
++	if (R_SUCCEEDED(rc))
++	{
++		rc = threadStart(&stream->thread);
++		if (R_FAILED(rc))
++		{
++			threadClose(&stream->thread);
++		}
++	}
++	if (R_FAILED(rc))
++	{
++		SDL_SetError("audio thread failed: 0x%x", rc);
++		stream->running = false;
++		Switch2_AudioClose(stream);
++		free(stream);
++		return NULL;
++	}
++	stream->threadStarted = true;
++	return stream;
++}
++
++void SDL_DestroyAudioStream(SDL_AudioStream *stream)
++{
++	if (stream == NULL)
++	{
++		return;
++	}
++	Switch2_AudioClose(stream);
++	free(stream);
++}
++
++bool SDL_LockAudioStream(SDL_AudioStream *stream)
++{
++	if (stream == NULL)
++	{
++		return false;
++	}
++	rmutexLock(&stream->lock);
++	return true;
++}
++
++bool SDL_UnlockAudioStream(SDL_AudioStream *stream)
++{
++	if (stream == NULL)
++	{
++		return false;
++	}
++	rmutexUnlock(&stream->lock);
++	return true;
++}
++
++bool SDL_PutAudioStreamData(SDL_AudioStream *stream, const void *buf, int len)
++{
++	const u8 *src = (const u8 *)buf;
++	bool ok = true;
++	if ((stream == NULL) || (buf == NULL) || (len < 0))
++	{
++		return SDL_SetError("invalid audio data");
++	}
++	rmutexLock(&stream->lock);
++	if (len > SWITCH2_AUDIO_QUEUE_BYTES - stream->queueBytes)
++	{
++		ok = SDL_SetError("audio queue full");
++	}
++	else
++	{
++		int tail = (stream->queueHead + stream->queueBytes) % SWITCH2_AUDIO_QUEUE_BYTES;
++		int remaining = len;
++		while (remaining > 0)
++		{
++			int chunk = SWITCH2_AUDIO_QUEUE_BYTES - tail;
++			if (chunk > remaining)
++			{
++				chunk = remaining;
++			}
++			memcpy(stream->queue + tail, src, (size_t)chunk);
++			src += chunk;
++			remaining -= chunk;
++			tail = (tail + chunk) % SWITCH2_AUDIO_QUEUE_BYTES;
++		}
++		stream->queueBytes += len;
++	}
++	rmutexUnlock(&stream->lock);
++	return ok;
++}
++
++int SDL_GetAudioStreamQueued(SDL_AudioStream *stream)
++{
++	int queued;
++	if (stream == NULL)
++	{
++		return -1;
++	}
++	rmutexLock(&stream->lock);
++	queued = stream->queueBytes;
++	rmutexUnlock(&stream->lock);
++	return queued;
++}
++
++bool SDL_ClearAudioStream(SDL_AudioStream *stream)
++{
++	if (stream == NULL)
++	{
++		return false;
++	}
++	rmutexLock(&stream->lock);
++	stream->queueHead = 0;
++	stream->queueBytes = 0;
++	rmutexUnlock(&stream->lock);
++	return true;
++}
++
++bool SDL_PauseAudioStreamDevice(SDL_AudioStream *stream)
++{
++	if (stream == NULL)
++	{
++		return false;
++	}
++	rmutexLock(&stream->lock);
++	stream->paused = true;
++	rmutexUnlock(&stream->lock);
++	return true;
++}
++
++bool SDL_ResumeAudioStreamDevice(SDL_AudioStream *stream)
++{
++	if (stream == NULL)
++	{
++		return false;
++	}
++	rmutexLock(&stream->lock);
++	stream->paused = false;
++	rmutexUnlock(&stream->lock);
++	return true;
++}
++
++SDL_AudioDeviceID SDL_GetAudioStreamDevice(SDL_AudioStream *stream)
++{
++	return stream ? (SDL_AudioDeviceID)2 : 0;
++}
++
++bool SDL_GetAudioDeviceFormat(SDL_AudioDeviceID devid, SDL_AudioSpec *spec, int *sample_frames)
++{
++	(void)devid;
++	if (spec)
++	{
++		spec->format = SDL_AUDIO_S16;
++		spec->channels = 2;
++		spec->freq = 48000;
++	}
++	if (sample_frames)
++	{
++		*sample_frames = SWITCH2_AUDIO_BUFFER_FRAMES;
++	}
++	return true;
++}
++
++bool SDL_GetAudioStreamFormat(SDL_AudioStream *stream, SDL_AudioSpec *src_spec, SDL_AudioSpec *dst_spec)
++{
++	if (stream == NULL)
++	{
++		return SDL_SetError("no stream");
++	}
++	if (src_spec)
++	{
++		*src_spec = stream->spec;
++	}
++	if (dst_spec)
++	{
++		*dst_spec = stream->spec; // audren resamples the voice to 48 kHz
++	}
++	return true;
++}
++
++const char *SDL_GetCurrentAudioDriver(void)
++{
++	return "audren";
++}
++
++// ---------------------------------------------------------------------------
++// Filesystem
++
++extern char **__system_argv __attribute__((weak));
++extern int __system_argc __attribute__((weak));
++
++#ifndef CTR_SWITCH2_DEFAULT_BASE
++#define CTR_SWITCH2_DEFAULT_BASE "sdmc:/switch/ctr-native/"
++#endif
++
++static char s_basePath[512];
++
++const char *SDL_GetBasePath(void)
++{
++	if (s_basePath[0] != '\0')
++	{
++		return s_basePath;
++	}
++	snprintf(s_basePath, sizeof(s_basePath), "%s", CTR_SWITCH2_DEFAULT_BASE);
++	// hbmenu passes the NRO path, e.g. sdmc:/switch/ctr-native/ctr-native.nro.
++	if ((&__system_argc != NULL) && (&__system_argv != NULL) && (__system_argv != NULL) && (__system_argc > 0) && (__system_argv[0] != NULL) &&
++	    (strncmp(__system_argv[0], "sdmc:/", 6) == 0))
++	{
++		const char *slash = strrchr(__system_argv[0], '/');
++		size_t len = slash ? (size_t)(slash - __system_argv[0]) + 1 : 0;
++		if ((len > 0) && (len < sizeof(s_basePath)))
++		{
++			memcpy(s_basePath, __system_argv[0], len);
++			s_basePath[len] = '\0';
++		}
++	}
++	return s_basePath;
++}
++
++char *SDL_GetPrefPath(const char *org, const char *app)
++{
++	char path[600];
++	(void)org;
++	(void)app;
++	snprintf(path, sizeof(path), "%s", SDL_GetBasePath());
++	return strdup(path);
++}
++
++const char *SDL_GetUserFolder(SDL_Folder folder)
++{
++	(void)folder;
++	return SDL_GetBasePath();
++}
++
++bool SDL_CreateDirectory(const char *path)
++{
++	if ((path == NULL) || (path[0] == '\0'))
++	{
++		return SDL_SetError("invalid path");
++	}
++	if ((mkdir(path, 0777) == 0) || (errno == EEXIST))
++	{
++		return true;
++	}
++	return SDL_SetError("mkdir %s failed: %s", path, strerror(errno));
++}
++
++// ---------------------------------------------------------------------------
++// C library gaps in newlib for this target
++
++#include <time.h>
++
++int timespec_get(struct timespec *ts, int base)
++{
++	if ((ts == NULL) || (base != TIME_UTC) || (clock_gettime(CLOCK_REALTIME, ts) != 0))
++	{
++		return 0;
++	}
++	return base;
++}
+-- 
+2.49.0
+

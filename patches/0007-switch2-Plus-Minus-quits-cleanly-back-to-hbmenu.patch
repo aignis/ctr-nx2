@@ -1,0 +1,37 @@
+From 017a199834af740ba5a8ddc31b6b9003edf3e123 Mon Sep 17 00:00:00 2001
+From: aignis <6974796+aignis@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 11:48:29 +0100
+Subject: [PATCH] switch2: Plus+Minus quits cleanly back to hbmenu
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ platform/switch2/sdl3_switch2.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/platform/switch2/sdl3_switch2.c b/platform/switch2/sdl3_switch2.c
+index 123787bd..52bee0d7 100644
+--- a/platform/switch2/sdl3_switch2.c
++++ b/platform/switch2/sdl3_switch2.c
+@@ -905,6 +905,19 @@ static void Switch2_PadUpdate(void)
+ 			s_vibrationReady[i] = false;
+ 			Switch2_PushEvent(&event);
+ 		}
++		if (connected && !s_quitSent)
++		{
++			const u64 buttons = padGetButtons(&s_pads[i]);
++			// Plus + Minus simultaneously sends quit event to return cleanly to hbmenu
++			if ((buttons & (HidNpadButton_Plus | HidNpadButton_Minus)) == (HidNpadButton_Plus | HidNpadButton_Minus))
++			{
++				SDL_Event quit;
++				memset(&quit, 0, sizeof(quit));
++				quit.type = SDL_EVENT_QUIT;
++				s_quitSent = true;
++				Switch2_PushEvent(&quit);
++			}
++		}
+ 	}
+ }
+ 
+-- 
+2.49.0
+

@@ -1,0 +1,1319 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: aignis <6974796+aignis@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 13:00:00 +0100
+Subject: [PATCH] native: add language selection and options
+
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b2d5cb9a..bdbaab7a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -304,6 +304,8 @@ if(CTR_NATIVE_SWITCH2)
+             CTR_NATIVE_XA_MUSIC_OPTIONAL=1
+             CTR_NATIVE_TEST_STR_OPTIONAL=1
+         )
++    else()
++        target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_NTSC_ONLY=1)
+     endif()
+     if(CTR_SWITCH2_SKIP_INTRO)
+         target_compile_definitions(ctr_native PRIVATE CTR_SKIP_INTRO=1)
+diff --git a/game/230/D230.c b/game/230/D230.c
+index 80ecb3b7..af8cb6be 100644
+--- a/game/230/D230.c
++++ b/game/230/D230.c
+@@ -12,6 +12,24 @@
+ #define CHEAT_O BTN_CIRCLE
+ #define CHEAT_X BTN_CROSS_one
+ 
++// Original PAL boot menu data, kept outside the NTSC overlay structure so its
++// ABI stays unchanged. The input callback adapts PAL loading to this port.
++#if defined(CTR_NATIVE) && (UINTPTR_MAX > UINT32_MAX)
++static struct MenuRow s_palBootLanguageRows[] = {
++    {0x85, 0, 1, 0, 0}, {0x86, 0, 2, 1, 1}, {0x87, 1, 3, 2, 2},
++    {0x88, 2, 4, 3, 3}, {0x89, 3, 5, 4, 4}, {0x8a, 4, 5, 5, 5},
++    {RECTMENU_STRING_NONE},
++};
++struct RectMenu g_palBootLanguageMenu = {
++    .stringIndexTitle = RECTMENU_STRING_NONE,
++    .posX_curr = 256,
++    .posY_curr = 118,
++    .state = RECTMENU_STATE_EXEC_CENTERED,
++    .rows = s_palBootLanguageRows,
++    .funcPtr = NativeOptions_PalLanguageProc,
++};
++#endif
++
+ struct OverlayDATA_230 D230 =
+     {
+         // MAIN MENU CONSTS
+diff --git a/game/230/MM_CupSelect.c b/game/230/MM_CupSelect.c
+index 66ebc413..ef922a89 100644
+--- a/game/230/MM_CupSelect.c
++++ b/game/230/MM_CupSelect.c
+@@ -119,9 +119,29 @@ void MM_CupSelect_MenuProc(struct RectMenu *menu)
+ 		int startX = (s16)D230.transitionMeta_cupSel[cupIndex].currX + (cupIndex & 1) * MM_CUP_SELECT_COLUMN_WIDTH;
+ 		int startY = (s16)D230.transitionMeta_cupSel[cupIndex].currY + (cupIndex >> 1) * MM_CUP_SELECT_ROW_HEIGHT;
+ 
++#if defined(CTR_NATIVE)
++		// PAL cup names are much longer than the US ones ("TORNEO DE LA GEMA
++		// AMARILLA"): keep the centred text inside the 512-pixel screen.
++		{
++			char *cupName = sdata->lngStrings[data.ArcadeCups[cupIndex].lngIndex_CupName];
++			const int half = DecalFont_GetLineWidth(cupName, FONT_CREDITS) / 2;
++			int nameX = startX + MM_CUP_SELECT_NAME_X_OFFSET;
++
++			if (nameX + half > 508)
++			{
++				nameX = 508 - half;
++			}
++			if (nameX - half < 4)
++			{
++				nameX = 4 + half;
++			}
++			DecalFont_DrawLine(cupName, nameX, startY + MM_CUP_SELECT_NAME_Y_OFFSET, FONT_CREDITS, txtColor);
++		}
++#else
+ 		// draw the name of the cup
+ 		DecalFont_DrawLine(sdata->lngStrings[data.ArcadeCups[cupIndex].lngIndex_CupName], startX + MM_CUP_SELECT_NAME_X_OFFSET,
+ 		                   startY + MM_CUP_SELECT_NAME_Y_OFFSET, FONT_CREDITS, txtColor);
++#endif
+ 
+ 		startX = startX + MM_CUP_SELECT_CONTENT_X_OFFSET;
+ 		startY = startY + MM_CUP_SELECT_CONTENT_Y_OFFSET;
+diff --git a/game/230/MM_MenuFlow.c b/game/230/MM_MenuFlow.c
+index ee3a06f3..075e2012 100644
+--- a/game/230/MM_MenuFlow.c
++++ b/game/230/MM_MenuFlow.c
+@@ -53,6 +53,11 @@ void MM_MenuProc_Main(struct RectMenu *mainMenu)
+ 		mainMenu->rows = &D230.rowsMainMenuWithScrapbook[0];
+ 	}
+ 
++#if defined(CTR_NATIVE)
++	// OPTIONS row, its screen, and the language select on boot
++	NativeOptions_MainMenuUpdate(mainMenu);
++#endif
++
+ #if defined(CTR_NATIVE)
+ 	if (g_cfg_unlockAll)
+ 	{
+@@ -154,6 +159,13 @@ void MM_MenuProc_Main(struct RectMenu *mainMenu)
+ 		return;
+ 	}
+ 
++#if defined(CTR_NATIVE)
++	if (NativeOptions_MainMenuChoose(mainMenu, mainMenu->rows[mainMenu->rowSelected].stringIndex))
++	{
++		return;
++	}
++#endif
++
+ 	// clear flags from game mode
+ 	gGT->gameMode1 &= ~(BATTLE_MODE | ADVENTURE_MODE | TIME_TRIAL | ADVENTURE_ARENA | ARCADE_MODE | ADVENTURE_CUP);
+ 
+@@ -170,6 +182,7 @@ void MM_MenuProc_Main(struct RectMenu *mainMenu)
+ 	// get LNG index of row selected
+ 	s16 choose = mainMenu->rows[mainMenu->rowSelected].stringIndex;
+ 
++
+ 	// Adventure Mode
+ 	if (choose == LNG_ADVENTURE)
+ 	{
+diff --git a/game/230/MM_Scrapbook.c b/game/230/MM_Scrapbook.c
+index 1a6b7bc9..e4745104 100644
+--- a/game/230/MM_Scrapbook.c
++++ b/game/230/MM_Scrapbook.c
+@@ -101,7 +101,8 @@ void MM_Scrapbook_PlayMovie(struct RectMenu *menu)
+ 			if (NativeAudio_PlayXAFile(SCRAPBOOK_NATIVE_XA_PATH, SCRAPBOOK_NATIVE_XA_CHANNEL, sdata->vol_Music << 7, sdata->vol_Music << 7) == 0)
+ 			{
+ 				NativeSTR_Stop();
+-				goto GO_BACK;
++				D230.scrapbookState = SCRAP_STOP;
++				return;
+ 			}
+ 			s_scrapbookNativeFramesUploaded = 0;
+ 			s_scrapbookNativeStartVBlank = Platform_GetVBlankCount();
+@@ -136,7 +137,8 @@ void MM_Scrapbook_PlayMovie(struct RectMenu *menu)
+ 		}
+ #endif
+ 
+-		goto GO_BACK;
++		D230.scrapbookState = SCRAP_STOP;
++		return;
+ 
+ 	// Actually play the movie
+ 	case SCRAP_PLAY:
+@@ -241,8 +243,6 @@ void MM_Scrapbook_PlayMovie(struct RectMenu *menu)
+ 		{
+ 			RaceFlag_BeginTransition(1);
+ 		}
+-	GO_BACK:
+-
+ 		D230.scrapbookState = SCRAP_EXIT;
+ 		break;
+ 
+diff --git a/game/DecalFont.c b/game/DecalFont.c
+index d2a09c98..9f5de190 100644
+--- a/game/DecalFont.c
++++ b/game/DecalFont.c
+@@ -1,5 +1,11 @@
+ #include <common.h>
+ 
++#if defined(CTR_NATIVE) && !defined(CTR_NATIVE_NTSC_ONLY)
++// Extracted locally from the user's PAL disc by extract-pal.py.
++// Never distribute the original game's tables in the source repository.
++#include <pal_font_tables.h>
++#endif
++
+ // NOTE(aalhendi): ASM-verified NTSC-U 926 0x800223f4-0x800224d0.
+ int DecalFont_GetLineWidthStrlen(char *character, int len, int fontType)
+ {
+@@ -63,7 +69,11 @@ int DecalFont_GetLineWidthStrlen(char *character, int len, int fontType)
+ #endif
+ 
+ // if normal character
+-#if BUILD != EurRetail
++#if defined(CTR_NATIVE) && !defined(CTR_NATIVE_NTSC_ONLY)
++		// 0x03 is the diacritical tilde: it advances no pixels, the next
++		// character is drawn under it (Ñ)
++		if (c > 3)
++#elif BUILD != EurRetail
+ 		if (c > 2)
+ #else
+ 		if (c > 3)
+@@ -97,6 +107,10 @@ int DecalFont_GetLineWidth(char *str, s16 fontType)
+ void DecalFont_DrawLineStrlen(char *str, s16 len, int posX, s16 posY, s16 fontType, int flags)
+ {
+ 	struct GameTracker *gGT = sdata->gGT;
++#if defined(CTR_NATIVE)
++	// Undo the extra horizontal stretch applied to the 16:9 UI.
++	const int nativeTextAnchorX = posX;
++#endif
+ 
+ 	// text is justified left by default
+ 	if (flags & (JUSTIFY_CENTER | JUSTIFY_RIGHT))
+@@ -124,6 +138,9 @@ void DecalFont_DrawLineStrlen(char *str, s16 len, int posX, s16 posY, s16 fontTy
+ 
+ 	for (; *str != 0 && len != 0; str++, len--)
+ 	{
++#if defined(CTR_NATIVE)
++		POLY_GT4 *nativeTextPoly = (POLY_GT4 *)gGT->backBuffer->primMem.cursor;
++#endif
+ 		u8 *strcopy = (u8 *)str;
+ 		u16 iconID = 0xff;
+ 		s16 charWidth = data.font_charPixWidth[fontType];
+@@ -138,6 +155,10 @@ void DecalFont_DrawLineStrlen(char *str, s16 len, int posX, s16 posY, s16 fontTy
+ 
+ #endif
+ 
++#if defined(CTR_NATIVE) && !defined(CTR_NATIVE_NTSC_ONLY)
++		b32 upsideDownCharacter = false;
++#endif
++
+ 		u32 *ptrColor = data.ptrColor[flags];
+ 
+ #if BUILD >= JpnTrial
+@@ -246,6 +267,34 @@ void DecalFont_DrawLineStrlen(char *str, s16 len, int posX, s16 posY, s16 fontTy
+ 			pixHeightExtra = data.font_indentPixDimensions[(fontType * 2) + 1];
+ 		}
+ 
++#if defined(CTR_NATIVE) && !defined(CTR_NATIVE_NTSC_ONLY)
++		// Same extra glyphs as the PAL build, but with the tables above.
++		// Ñ: the tilde is an underscore shrunk and placed over the next letter.
++		if (*strcopy == 3)
++		{
++			iconID = 0x2f;
++			pixWidthExtra = s_nativeFontEurTilde[fontType * 3];
++			pixHeightExtra = s_nativeFontEurTilde[(fontType * 3) + 1];
++			iconScale = s_nativeFontEurTilde[(fontType * 3) + 2];
++			charWidth = 0;
++		}
++		// ¡ and ¿ are the same glyphs flipped vertically
++		if ((*strcopy == '#') || (*strcopy == '$'))
++		{
++			upsideDownCharacter = true;
++			iconID = (*strcopy == '#') ? 0x25 : 0x2e;
++			pixWidthExtra = s_nativeFontEurInvertedMark[fontType * 2];
++			pixHeightExtra = s_nativeFontEurInvertedMark[(fontType * 2) + 1];
++		}
++		// º (ordinal indicator)
++		if (*strcopy == '&')
++		{
++			iconID = 0x2c;
++			pixWidthExtra = s_nativeFontEurOrdinal[fontType * 2];
++			pixHeightExtra = s_nativeFontEurOrdinal[(fontType * 2) + 1];
++		}
++#endif
++
+ #else
+ 
+ 		// europe only has 0x60 characters
+@@ -452,15 +501,33 @@ void DecalFont_DrawLineStrlen(char *str, s16 len, int posX, s16 posY, s16 fontTy
+ 
+ 				if (iconID < gGT->iconGroup[iconGroupID]->numIcons)
+ 				{
+-					DecalHUD_DrawPolyGT4(IconGroup_GetIcon(gGT->iconGroup[iconGroupID], (size_t)iconID, "font icon"),
++#if defined(CTR_NATIVE) && !defined(CTR_NATIVE_NTSC_ONLY)
++					if (upsideDownCharacter)
++					{
++						// ¡ and ¿: same glyphs as ! and ?, rotated 180°
++						DecalHUD_Arrow2D(IconGroup_GetIcon(gGT->iconGroup[iconGroupID], (size_t)iconID, "font icon"),
+ 
+-					                     posX + pixWidthExtra, posY + pixHeightExtra,
++						                 posX + pixWidthExtra, posY + pixHeightExtra,
+ 
+-					                     &gGT->backBuffer->primMem, gGT->pushBuffer_UI.ptrOT,
++						                 &gGT->backBuffer->primMem, gGT->pushBuffer_UI.ptrOT,
+ 
+-					                     ptrColor[0], ptrColor[1], ptrColor[2], ptrColor[3],
++						                 ptrColor[2], ptrColor[3], ptrColor[0], ptrColor[1],
+ 
+-					                     0, iconScale);
++						                 0, iconScale, 0x800);
++					}
++					else
++#endif
++					{
++						DecalHUD_DrawPolyGT4(IconGroup_GetIcon(gGT->iconGroup[iconGroupID], (size_t)iconID, "font icon"),
++
++						                     posX + pixWidthExtra, posY + pixHeightExtra,
++
++						                     &gGT->backBuffer->primMem, gGT->pushBuffer_UI.ptrOT,
++
++						                     ptrColor[0], ptrColor[1], ptrColor[2], ptrColor[3],
++
++						                     0, iconScale);
++					}
+ 				}
+ 			}
+ 
+@@ -516,6 +583,15 @@ void DecalFont_DrawLineStrlen(char *str, s16 len, int posX, s16 posY, s16 fontTy
+ 
+ #endif
+ 		}
++#if defined(CTR_NATIVE)
++		if (g_cfg_widescreen && gGT->backBuffer->primMem.cursor == (void *)(nativeTextPoly + 1))
++		{
++			nativeTextPoly->x0 = nativeTextAnchorX + ((s16)nativeTextPoly->x0 - nativeTextAnchorX) * 3 / 4;
++			nativeTextPoly->x1 = nativeTextAnchorX + ((s16)nativeTextPoly->x1 - nativeTextAnchorX) * 3 / 4;
++			nativeTextPoly->x2 = nativeTextAnchorX + ((s16)nativeTextPoly->x2 - nativeTextAnchorX) * 3 / 4;
++			nativeTextPoly->x3 = nativeTextAnchorX + ((s16)nativeTextPoly->x3 - nativeTextAnchorX) * 3 / 4;
++		}
++#endif
+ 		posX += charWidth;
+ 	}
+ }
+diff --git a/game/LOAD/LOAD_Assets.c b/game/LOAD/LOAD_Assets.c
+index 0770d7c5..46aafe47 100644
+--- a/game/LOAD/LOAD_Assets.c
++++ b/game/LOAD/LOAD_Assets.c
+@@ -246,6 +246,20 @@ struct LngFile
+ // It is derived entirely from lngFile, so checkpoint restore rebuilds it.
+ static char *s_nativeLanguageStrings[0x1000];
+ 
++// PAL inserts three controller prompts in its string table. The game code
++// uses NTSC-U indices, so remove those insertions from the pointer table.
++static void LOAD_MapPalLanguageStrings(int numStrings)
++{
++#if defined(CTR_NATIVE_XA_MUSIC_OPTIONAL)
++	if (numStrings < 0x237) return;
++	for (int i = 0x223; i < numStrings - 3; i++)
++	{
++		int shift = (i == 0x223) ? 1 : (i <= 0x228 ? 2 : 3);
++		s_nativeLanguageStrings[i] = s_nativeLanguageStrings[i + shift];
++	}
++#endif
++}
++
+ int LOAD_RebuildNativeLanguagePointers(void)
+ {
+ 	struct LngFile *lngFile = sdata->lngFile;
+@@ -278,8 +292,10 @@ int LOAD_RebuildNativeLanguagePointers(void)
+ 		s_nativeLanguageStrings[i] = (char *)((u8 *)lngFile + stringOffset);
+ 	}
+ 
++	LOAD_MapPalLanguageStrings(numStrings);
+ 	sdata->numLngStrings = numStrings;
+ 	sdata->lngStrings = s_nativeLanguageStrings;
++	NativeOptions_InstallStrings();
+ 	return 1;
+ }
+ #endif
+@@ -303,10 +319,37 @@ void LOAD_LangFile(struct BigHeader *bigfile, int lang)
+ 	VSync(0);
+ #endif
+ 
++#if defined(CTR_NATIVE) && (UINTPTR_MAX > UINT32_MAX)
++	// CdRead writes whole 2048-byte sectors, including padding after the LNG.
++	// Reserve enough for every PAL language before the first load: reloading a
++	// larger file into the retail-sized buffer would corrupt the next allocation.
++	if (sdata->lngFile == NULL)
++	{
++		struct BigEntry *entries = BIG_GETENTRY(bigfile);
++		for (int slot = 1; slot <= 7; slot++)
++		{
++			u32 bytes = (u32)entries[BI_LANGUAGEFILE + slot].size;
++			u32 padded = (bytes + LOAD_CD_DATA_SECTOR_ROUND_MASK) & ~LOAD_CD_DATA_SECTOR_ROUND_MASK;
++			if (padded > (u32)sdata->langBufferSize)
++				sdata->langBufferSize = (int)padded;
++		}
++	}
++#endif
+ 	if (sdata->lngFile == 0)
+ 	{
+ 		sdata->lngFile = MEMPACK_AllocMem(sdata->langBufferSize /* "lang buffer" */);
++		if (sdata->lngFile == NULL)
++			return;
++	}
++#if defined(CTR_NATIVE) && (UINTPTR_MAX > UINT32_MAX)
++	{
++		struct BigEntry *entries = BIG_GETENTRY(bigfile);
++		u32 bytes = (u32)entries[BI_LANGUAGEFILE + lang].size;
++		u32 padded = (bytes + LOAD_CD_DATA_SECTOR_ROUND_MASK) & ~LOAD_CD_DATA_SECTOR_ROUND_MASK;
++		if (padded > (u32)sdata->langBufferSize)
++			return;
+ 	}
++#endif
+ 
+ 	lngFile = sdata->lngFile;
+ 
+@@ -350,10 +393,17 @@ void LOAD_LangFile(struct BigHeader *bigfile, int lang)
+ 	{
+ 		strArray[i] = (char *)((u8 *)lngFile + CTR_ReadU32LE(&serializedOffsets[i]));
+ 	}
++#if UINTPTR_MAX > UINT32_MAX
++	LOAD_MapPalLanguageStrings(numStrings);
++#endif
+ #if BUILD == EurRetail
+ 	// set voicelines to new lang
+ 	CDSYS_SetXAToLang(lang);
+ #endif
++#if defined(CTR_NATIVE)
++	// native OPTIONS labels live in spare slots after the language strings
++	NativeOptions_InstallStrings();
++#endif
+ }
+ 
+ // NOTE(aalhendi): ASM-verified NTSC-U 926 0x80032c24-0x80032d30.
+diff --git a/game/MAIN/MainMain.c b/game/MAIN/MainMain.c
+index d3410818..6916da5c 100644
+--- a/game/MAIN/MainMain.c
++++ b/game/MAIN/MainMain.c
+@@ -644,7 +644,12 @@ void StateZero()
+ 
+ 	// English=1
+ 	// PAL SCES02105 calls it multiple times
++#if defined(CTR_NATIVE) && (UINTPTR_MAX > UINT32_MAX)
++	// language chosen in OPTIONS / at boot (PAL language files, slots 2-7)
++	LOAD_LangFile(sdata->ptrBigfile1, NativeOptions_TextLangSlot());
++#else
+ 	LOAD_LangFile(sdata->ptrBigfile1, 1);
++#endif
+ 	GAMEPROG_NewGame_OnBoot();
+ 	gGT->overlayIndex_null_notUsed = 0;
+ 
+diff --git a/include/platform.h b/include/platform.h
+index efa1fc92..0bfcdb4d 100644
+--- a/include/platform.h
++++ b/include/platform.h
+@@ -46,4 +46,18 @@ extern int g_cfg_widescreen;
+ // scrapbook, Medium/Hard), as ctr-web's "desbloquear todo".
+ extern int g_cfg_unlockAll;
+ 
++// Native OPTIONS menu and boot language select (platform/native_options.c).
++struct RectMenu;
++void NativeOptions_PalLanguageProc(struct RectMenu *menu);
++void NativeOptions_InstallStrings(void);
++int NativeOptions_TextLangSlot(void);
++void NativeOptions_MainMenuUpdate(struct RectMenu *mainMenu);
++int NativeOptions_MainMenuChoose(struct RectMenu *mainMenu, short choose);
++int NativeOptions_LanguageFromCode(const char *code);
++const char *NativeOptions_LanguageCode(void);
++void NativeOptions_Configure(const char *language, int askLanguage, int internalScale, int rumble, void (*saveHook)(void));
++int NativeOptions_AskLanguage(void);
++int NativeOptions_InternalScale(void);
++int NativeOptions_Rumble(void);
++
+ #endif
+diff --git a/main.c b/main.c
+index 0d796d38..7ef900a9 100644
+--- a/main.c
++++ b/main.c
+@@ -93,6 +93,7 @@
+ #include "platform/native_state_digest.c"
+ #include "platform/native_storage.c"
+ #include "platform/native_str.c"
++#include "platform/native_options.c"
+ 
+ #ifndef CC
+ #if defined(__GNUC__)
+@@ -369,10 +370,15 @@ struct NativeLaunchOptions
+ 
+ // Returns 1 when a complete NTSC-U asset source is selected, 0 when the
+ // selected source is missing or invalid, and -1 for a storage/path failure.
+-#if defined(CTR_NATIVE_SWITCH2)
+-// ctr-native.ini next to the NRO: key=value lines, written with the defaults
++#if defined(CTR_NATIVE)
++// ctr-native.ini next to the executable: key=value lines, written with the defaults
+ // on first start. Unknown keys are ignored.
+ global_variable int s_switch2InternalScale = 3;
++global_variable int s_switch2Rumble = 40;
++global_variable int s_switch2AskLanguage = 1;
++global_variable char s_switch2Language[8] = "SPN";
++global_variable char s_switch2CaptureSwaps[128];
++global_variable char s_switch2ConfigPath[1024];
+ 
+ static void Switch2Config_Set(const char *key, const char *value)
+ {
+@@ -396,20 +402,72 @@ static void Switch2Config_Set(const char *key, const char *value)
+ 			fprintf(stderr, "[Switch2] unknown voices=%s (ENG, SPN, FRN, GRM, ITL, DCH)\n", value);
+ 		}
+ 	}
++	else if (strcmp(key, "language") == 0)
++	{
++		if (NativeOptions_LanguageFromCode(value) >= 0)
++		{
++			snprintf(s_switch2Language, sizeof(s_switch2Language), "%s", value);
++		}
++	}
++	else if (strcmp(key, "ask_language") == 0)
++	{
++		s_switch2AskLanguage = number != 0;
++	}
+ 	else if (strcmp(key, "unlock_all") == 0)
+ 	{
+ 		g_cfg_unlockAll = number != 0;
+ 	}
++	else if (strcmp(key, "rumble") == 0)
++	{
++		s_switch2Rumble = (number < 0) ? 0 : ((number > 100) ? 100 : number);
++	}
+ 	else if (strcmp(key, "capture_swaps") == 0)
+ 	{
+ 		// diagnostics: capture_<n>.bmp next to the NRO at these swap counts
++		snprintf(s_switch2CaptureSwaps, sizeof(s_switch2CaptureSwaps), "%s", value);
+ 		NativeRenderer_SetCaptureSwaps(value);
+ 	}
+ }
+ 
++// Rewrites ctr-native.ini with the current values (the OPTIONS menu calls it).
++static void Switch2Config_Save(void)
++{
++	FILE *file = fopen(s_switch2ConfigPath, "w");
++	if (file == NULL)
++	{
++		fprintf(stderr, "[Switch2] cannot write %s\n", s_switch2ConfigPath);
++		return;
++	}
++	fprintf(file,
++	        "# CTR Native para Switch 2. Se cambia desde OPCIONES en el menu principal,\n"
++	        "# o aqui (vuelve a abrir el juego).\n"
++	        "# widescreen: 1 = 16:9, 0 = 4:3\n"
++	        "widescreen=%d\n"
++	        "# internal_scale: resolucion interna 1-4 (x 240 lineas)\n"
++	        "internal_scale=%d\n"
++	        "# bilinear: 1 = texturas filtradas\n"
++	        "bilinear=%d\n"
++	        "# language: idioma de los textos (ENG, FRN, GRM, ITL, SPN, DCH)\n"
++	        "language=%s\n"
++	        "# ask_language: 1 = elegir idioma al arrancar\n"
++	        "ask_language=%d\n"
++	        "# voices: voces XA (las que haya en assets/XA)\n"
++	        "voices=%s\n"
++	        "# rumble: intensidad de la vibracion 0-100 (0 = apagada)\n"
++	        "rumble=%d\n"
++	        "# unlock_all: 1 = todo desbloqueado en el menu\n"
++	        "unlock_all=%d\n",
++	        g_cfg_widescreen, NativeOptions_InternalScale(), g_cfg_bilinearFiltering, NativeOptions_LanguageCode(), NativeOptions_AskLanguage(),
++	        NativeAssets_GetXAVoiceLanguage(), NativeOptions_Rumble(), g_cfg_unlockAll);
++	if (s_switch2CaptureSwaps[0] != '\0')
++	{
++		fprintf(file, "capture_swaps=%s\n", s_switch2CaptureSwaps);
++	}
++	fclose(file);
++}
++
+ static void Switch2Config_Load(const char *basePath)
+ {
+-	char path[1024];
+ 	char line[256];
+ 	FILE *file;
+ 
+@@ -418,73 +476,61 @@ static void Switch2Config_Load(const char *basePath)
+ 	g_cfg_unlockAll = 0;
+ 	NativeAssets_SetXAVoiceLanguage("SPN");
+ 
+-	snprintf(path, sizeof(path), "%sctr-native.ini", basePath ? basePath : "");
+-	file = fopen(path, "r");
+-	if (file == NULL)
+-	{
+-		file = fopen(path, "w");
+-		if (file != NULL)
+-		{
+-			fputs("# CTR Native para Switch 2. Cambia los valores y vuelve a abrir el juego.\n"
+-			      "# widescreen: 1 = 16:9, 0 = 4:3\n"
+-			      "widescreen=1\n"
+-			      "# internal_scale: resolucion interna 1-4 (x 240 lineas)\n"
+-			      "internal_scale=3\n"
+-			      "# bilinear: 1 = texturas filtradas\n"
+-			      "bilinear=0\n"
+-			      "# voices: carpeta de voces XA (ENG, SPN, FRN, GRM, ITL, DCH)\n"
+-			      "voices=SPN\n"
+-			      "# unlock_all: 1 = todo desbloqueado en el menu\n"
+-			      "unlock_all=0\n",
+-			      file);
+-			fclose(file);
+-		}
+-		printf("[Switch2] wrote default %s\n", path);
+-		return;
+-	}
+-	while (fgets(line, sizeof(line), file) != NULL)
++	snprintf(s_switch2ConfigPath, sizeof(s_switch2ConfigPath), "%sctr-native.ini", basePath ? basePath : "");
++	file = fopen(s_switch2ConfigPath, "r");
++	if (file != NULL)
+ 	{
+-		char *eq;
+-		char *end;
+-		char *key = line;
+-		while ((*key == ' ') || (*key == '\t'))
+-		{
+-			key++;
+-		}
+-		if ((*key == '#') || (*key == ';') || (*key == '\0'))
+-		{
+-			continue;
+-		}
+-		eq = strchr(key, '=');
+-		if (eq == NULL)
+-		{
+-			continue;
+-		}
+-		*eq = '\0';
+-		for (end = eq - 1; (end >= key) && ((*end == ' ') || (*end == '\t')); end--)
+-		{
+-			*end = '\0';
+-		}
+-		eq++;
+-		while ((*eq == ' ') || (*eq == '\t'))
++		while (fgets(line, sizeof(line), file) != NULL)
+ 		{
++			char *eq;
++			char *end;
++			char *key = line;
++			while ((*key == ' ') || (*key == '\t'))
++			{
++				key++;
++			}
++			if ((*key == '#') || (*key == ';') || (*key == '\0'))
++			{
++				continue;
++			}
++			eq = strchr(key, '=');
++			if (eq == NULL)
++			{
++				continue;
++			}
++			*eq = '\0';
++			for (end = eq - 1; (end >= key) && ((*end == ' ') || (*end == '\t')); end--)
++			{
++				*end = '\0';
++			}
+ 			eq++;
++			while ((*eq == ' ') || (*eq == '\t'))
++			{
++				eq++;
++			}
++			for (end = eq + strlen(eq) - 1; (end >= eq) && ((*end == '\n') || (*end == '\r') || (*end == ' ') || (*end == '\t')); end--)
++			{
++				*end = '\0';
++			}
++			Switch2Config_Set(key, eq);
+ 		}
+-		for (end = eq + strlen(eq) - 1; (end >= eq) && ((*end == '\n') || (*end == '\r') || (*end == ' ') || (*end == '\t')); end--)
+-		{
+-			*end = '\0';
+-		}
+-		Switch2Config_Set(key, eq);
++		fclose(file);
+ 	}
+-	fclose(file);
+-	printf("[Switch2] config %s: widescreen=%d internal_scale=%d bilinear=%d voices=%s unlock_all=%d\n", path, g_cfg_widescreen,
+-	       s_switch2InternalScale, g_cfg_bilinearFiltering, NativeAssets_GetXAVoiceLanguage(), g_cfg_unlockAll);
++	NativeOptions_Configure(s_switch2Language, s_switch2AskLanguage, s_switch2InternalScale, s_switch2Rumble, Switch2Config_Save);
++#if defined(CTR_NATIVE_SWITCH2)
++	Switch2_SetRumbleStrength(NativeOptions_Rumble());
++#endif
++	// (re)write it so new keys appear in files from older builds
++	Switch2Config_Save();
++	printf("[Switch2] config %s: widescreen=%d internal_scale=%d bilinear=%d language=%s voices=%s rumble=%d unlock_all=%d\n", s_switch2ConfigPath,
++	       g_cfg_widescreen, NativeOptions_InternalScale(), g_cfg_bilinearFiltering, NativeOptions_LanguageCode(), NativeAssets_GetXAVoiceLanguage(),
++	       NativeOptions_Rumble(), g_cfg_unlockAll);
+ }
+ 
+ static void Switch2Config_ApplyRenderer(void)
+ {
+-	const int applied = NativeRenderer_SetInternalResolutionScale(s_switch2InternalScale);
+-	Platform_Log("[Switch2] internal_scale requested=%d applied=%d widescreen=%d\n", s_switch2InternalScale, applied, g_cfg_widescreen);
++	const int applied = NativeRenderer_SetInternalResolutionScale(NativeOptions_InternalScale());
++	Platform_Log("[Switch2] internal_scale requested=%d applied=%d widescreen=%d\n", NativeOptions_InternalScale(), applied, g_cfg_widescreen);
+ }
+ #endif
+ 
+@@ -575,10 +621,6 @@ static int NativeApp_StartRuntime(const struct NativeLaunchOptions *options)
+ 	// the console's 1920x1080 surface.
+ 	printf("[CTR Native] %s\n", g_cfg_widescreen ? "Widescreen" : "4:3");
+ 	Platform_Init("Crash Team Racing", g_cfg_widescreen ? 1280 : 800, g_cfg_widescreen ? 720 : 600);
+-	if (Platform_IsInitialized())
+-	{
+-		Switch2Config_ApplyRenderer();
+-	}
+ #elif defined(USE_16BY9)
+ 	printf("[CTR Native] Widescreen\n");
+ 	Platform_Init("Crash Team Racing", 1280, 720);
+@@ -598,6 +640,9 @@ static int NativeApp_StartRuntime(const struct NativeLaunchOptions *options)
+ 	{
+ 		return NativeConsole_Return(1);
+ 	}
++#if defined(CTR_NATIVE)
++	Switch2Config_ApplyRenderer();
++#endif
+ 	Platform_Log("[CTR Session] version=%s build=%s compiler=%s target=%s\n", CTR_NATIVE_VERSION, CTR_NATIVE_BUILD_ID, CC,
+ 	             CTR_NATIVE_TARGET_NAME);
+ 	Platform_Log("[CTR Session] source=%s sdl=%d platform=%s\n", CTR_NATIVE_SOURCE_IDENTITY, SDL_GetVersion(), SDL_GetPlatform());
+@@ -930,9 +975,10 @@ int main(int argc, char *argv[])
+ 
+ 	printf("[CTR Native] SDL base path: %s\n", sdlBasePath ? sdlBasePath : "(null)");
+ 	fflush(stdout);
+-#if defined(CTR_NATIVE_SWITCH2)
++#if defined(CTR_NATIVE)
+ 	Switch2Config_Load(sdlBasePath);
+-#else
++#endif
++#if !defined(CTR_NATIVE_SWITCH2)
+ 	// Desktop overrides for the ctr-web options (Switch 2 reads ctr-native.ini).
+ 	if (getenv("CTR_NATIVE_VOICES") != NULL)
+ 	{
+diff --git a/platform/native_audio.c b/platform/native_audio.c
+index 942e35f8..2b5782a1 100644
+--- a/platform/native_audio.c
++++ b/platform/native_audio.c
+@@ -1714,7 +1714,13 @@ internal int NativeAudio_LookupXATrackInfo(int categoryID, int xaID, struct Nati
+ 		return 0;
+ 	}
+ 
+-	if (!NativeAudio_ReadFileBytes(NativeAssets_GetXAVoiceXNFPath(), &xnf))
++#if defined(CTR_NATIVE_XA_MUSIC_OPTIONAL)
++	// The supplied music XA is NTSC-U: its track order differs from PAL XNF.
++	const char *manifest = (categoryID == 0) ? "XA/ENG.XNF" : NativeAssets_GetXAVoiceXNFPath();
++#else
++	const char *manifest = NativeAssets_GetXAVoiceXNFPath();
++#endif
++	if (!NativeAudio_ReadFileBytes(manifest, &xnf))
+ 	{
+ 		return 0;
+ 	}
+diff --git a/platform/native_options.c b/platform/native_options.c
+new file mode 100644
+index 00000000..13b012fc
+--- /dev/null
++++ b/platform/native_options.c
+@@ -0,0 +1,483 @@
++// Native OPTIONS screen in the main menu, plus the PAL-style language select
++// on boot. Both are standalone RectMenus (sdata->ptrDesiredMenu), the same way
++// the PAL build showed its boot language menu, so the game centers them on
++// screen no matter how long the PAL labels are.
++//
++// Labels live in spare slots of the language string table (the LP64 pointer
++// table has room for 0x1000 strings; the PAL language files use 596), so the
++// menu code draws them like any other LNG string. They are rebuilt after every
++// language load and whenever a value changes.
++//
++// Text language: the converted BIGFILE keeps the PAL language files in the
++// NTSC-U slots 2-7 (UK English, French, German, Italian, Spanish, Dutch), so
++// LOAD_LangFile switches language at runtime. Voices: XA/<LANG>.XNF on the SD;
++// only the languages present are offered.
++
++#if defined(CTR_NATIVE) && (UINTPTR_MAX > UINT32_MAX)
++#define NATIVE_OPTIONS_ENABLED 1
++#else
++#define NATIVE_OPTIONS_ENABLED 0
++#endif
++
++#define NATIVE_OPT_LANG_COUNT 6
++#define NATIVE_OPT_LNG_BASE   0xF00
++#define NATIVE_OPT_BOOT_TIMEOUT 900 // 30 s, same as the PAL boot menu
++
++enum NativeOptRow
++{
++	NATIVE_OPT_ROW_SCREEN,
++	NATIVE_OPT_ROW_RESOLUTION,
++	NATIVE_OPT_ROW_FILTER,
++	NATIVE_OPT_ROW_VIBRATION,
++	NATIVE_OPT_ROW_UNLOCK,
++	NATIVE_OPT_ROW_BACK,
++	NATIVE_OPT_ROW_COUNT
++};
++
++enum NativeOptWord
++{
++	NATIVE_OPT_W_SCREEN,
++	NATIVE_OPT_W_RESOLUTION,
++	NATIVE_OPT_W_FILTER,
++	NATIVE_OPT_W_VIBRATION,
++	NATIVE_OPT_W_VOICES,
++	NATIVE_OPT_W_UNLOCK,
++	NATIVE_OPT_W_BACK,
++	NATIVE_OPT_W_ON,
++	NATIVE_OPT_W_OFF,
++	NATIVE_OPT_W_COUNT
++};
++
++// Uppercase without accents, like the PAL language files themselves.
++// Order: English, French, German, Italian, Spanish, Dutch.
++static const char *const s_nativeOptWords[NATIVE_OPT_LANG_COUNT][NATIVE_OPT_W_COUNT] = {
++    {"SCREEN", "RESOLUTION", "TEXTURE FILTER", "VIBRATION", "VOICES", "UNLOCK ALL", "BACK", "ON", "OFF"},
++    {"ECRAN", "RESOLUTION", "FILTRE TEXTURES", "VIBRATION", "VOIX", "TOUT DEBLOQUER", "RETOUR", "OUI", "NON"},
++    {"BILD", "AUFLOESUNG", "TEXTURFILTER", "VIBRATION", "STIMMEN", "ALLES FREISCHALTEN", "ZURUECK", "EIN", "AUS"},
++    {"SCHERMO", "RISOLUZIONE", "FILTRO TEXTURE", "VIBRAZIONE", "VOCI", "SBLOCCA TUTTO", "INDIETRO", "SI", "NO"},
++    {"PANTALLA", "RESOLUCION", "FILTRO TEXTURAS", "VIBRACION", "VOCES", "DESBLOQUEAR TODO", "VOLVER", "SI", "NO"},
++    {"BEELD", "RESOLUTIE", "TEXTUURFILTER", "TRILLING", "STEMMEN", "ALLES VRIJSPELEN", "TERUG", "AAN", "UIT"},
++};
++
++// Same order: NTSC-U language-file slot and XA voice folder.
++static const int s_nativeOptLangSlot[NATIVE_OPT_LANG_COUNT] = {2, 3, 4, 5, 6, 7};
++static const char *const s_nativeOptVoiceCode[NATIVE_OPT_LANG_COUNT] = {"ENG", "FRN", "GRM", "ITL", "SPN", "DCH"};
++
++#if defined(CTR_NATIVE_NTSC_ONLY)
++static int s_nativeOptLang = 0;
++static int s_nativeOptAskLanguage = 0;
++#else
++static int s_nativeOptLang = 4;        // Spanish, ctr-web's default
++static int s_nativeOptAskLanguage = 1; // show the language select on boot
++#endif
++static int s_nativeOptScale = 3;
++static int s_nativeOptRumble = 40; // 0-100
++static int s_nativeOptBootDone;
++static int s_nativeOptConfigured; // NativeOptions_Configure ran (Switch 2 ini)
++static int s_nativeOptBootPending; // language menu opened at boot (timeout)
++static int s_nativeOptBootTimer;
++static int s_nativeOptInputLock; // ignore the tap that opened a menu
++static char s_nativeOptText[NATIVE_OPT_ROW_COUNT][64];
++
++// Set by the platform (Switch 2 writes ctr-native.ini); NULL elsewhere.
++static void (*s_nativeOptSaveHook)(void);
++
++#if NATIVE_OPTIONS_ENABLED
++static void NativeOptions_MenuProc(struct RectMenu *menu);
++
++static struct MenuRow s_nativeOptRows[NATIVE_OPT_ROW_COUNT + 1];
++static struct MenuRow s_nativeOptMainRows[16];
++
++static struct RectMenu s_nativeOptMenu = {
++    .stringIndexTitle = LNG_OPTIONS,
++    .posX_curr = 256,
++    .posY_curr = 120,
++    .state = RECTMENU_STATE_EXEC_CENTERED,
++    .rows = &s_nativeOptRows[0],
++    .funcPtr = NativeOptions_MenuProc,
++};
++
++extern struct RectMenu g_palBootLanguageMenu;
++
++static struct RectMenu *s_nativeOptLangBack; // where the language menu returns
++#endif
++
++int NativeOptions_LanguageFromCode(const char *code)
++{
++	for (int i = 0; i < NATIVE_OPT_LANG_COUNT; i++)
++	{
++		if ((code != NULL) && (strcmp(code, s_nativeOptVoiceCode[i]) == 0))
++		{
++			return i;
++		}
++	}
++	return -1;
++}
++
++const char *NativeOptions_LanguageCode(void)
++{
++	return s_nativeOptVoiceCode[s_nativeOptLang];
++}
++
++void NativeOptions_Configure(const char *language, int askLanguage, int internalScale, int rumble, void (*saveHook)(void))
++{
++	const int lang = NativeOptions_LanguageFromCode(language);
++	if (lang >= 0)
++	{
++		s_nativeOptLang = lang;
++	}
++#if defined(CTR_NATIVE_NTSC_ONLY)
++	// NTSC data has only its own English string table and voices.
++	s_nativeOptLang = 0;
++	askLanguage = 0;
++#endif
++	// Voice language follows text: Spanish for Spanish, English otherwise.
++	NativeAssets_SetXAVoiceLanguage(s_nativeOptLang == 4 ? "SPN" : "ENG");
++	s_nativeOptAskLanguage = askLanguage != 0;
++	s_nativeOptScale = (internalScale < 1) ? 1 : ((internalScale > 4) ? 4 : internalScale);
++	s_nativeOptRumble = (rumble < 0) ? 0 : ((rumble > 100) ? 100 : rumble);
++	s_nativeOptSaveHook = saveHook;
++	s_nativeOptConfigured = 1;
++}
++
++int NativeOptions_AskLanguage(void)
++{
++	return s_nativeOptAskLanguage;
++}
++
++int NativeOptions_InternalScale(void)
++{
++	return s_nativeOptScale;
++}
++
++int NativeOptions_Rumble(void)
++{
++	return s_nativeOptRumble;
++}
++
++// NTSC-U language-file slot for LOAD_LangFile at boot.
++int NativeOptions_TextLangSlot(void)
++{
++#if defined(CTR_NATIVE_NTSC_ONLY)
++	return 1;
++#else
++	return s_nativeOptLangSlot[s_nativeOptLang];
++#endif
++}
++
++static void NativeOptions_ApplyRumble(void)
++{
++#if defined(CTR_NATIVE_SWITCH2)
++	Switch2_SetRumbleStrength(s_nativeOptRumble);
++#endif
++}
++
++// Rebuild the labels in the current language and put them in the string table.
++void NativeOptions_InstallStrings(void)
++{
++#if NATIVE_OPTIONS_ENABLED
++	const char *const *w = s_nativeOptWords[s_nativeOptLang];
++	char **lng = sdata->lngStrings;
++	char value[24];
++
++	// The LP64 pointer table has 0x1000 slots; the PAL files use 596, so the
++	// native labels live past numLngStrings in unused spare slots.
++	if ((lng == NULL) || (sdata->numLngStrings <= 0))
++	{
++		return;
++	}
++
++
++
++	snprintf(s_nativeOptText[NATIVE_OPT_ROW_SCREEN], 64, "%s: %s", w[NATIVE_OPT_W_SCREEN], g_cfg_widescreen ? "16:9" : "4:3");
++	snprintf(s_nativeOptText[NATIVE_OPT_ROW_RESOLUTION], 64, "%s: %dX", w[NATIVE_OPT_W_RESOLUTION], s_nativeOptScale);
++	snprintf(s_nativeOptText[NATIVE_OPT_ROW_FILTER], 64, "%s: %s", w[NATIVE_OPT_W_FILTER],
++	         g_cfg_bilinearFiltering ? w[NATIVE_OPT_W_ON] : w[NATIVE_OPT_W_OFF]);
++	if (s_nativeOptRumble <= 0)
++	{
++		snprintf(value, sizeof(value), "%s", w[NATIVE_OPT_W_OFF]);
++	}
++	else
++	{
++		snprintf(value, sizeof(value), "%d/10", (s_nativeOptRumble + 5) / 10);
++	}
++	snprintf(s_nativeOptText[NATIVE_OPT_ROW_VIBRATION], 64, "%s: %s", w[NATIVE_OPT_W_VIBRATION], value);
++	snprintf(s_nativeOptText[NATIVE_OPT_ROW_UNLOCK], 64, "%s: %s", w[NATIVE_OPT_W_UNLOCK], g_cfg_unlockAll ? w[NATIVE_OPT_W_ON] : w[NATIVE_OPT_W_OFF]);
++	snprintf(s_nativeOptText[NATIVE_OPT_ROW_BACK], 64, "%s", w[NATIVE_OPT_W_BACK]);
++
++	for (int i = 0; i < NATIVE_OPT_ROW_COUNT; i++)
++	{
++		lng[NATIVE_OPT_LNG_BASE + i] = s_nativeOptText[i];
++	}
++#endif
++}
++
++#if NATIVE_OPTIONS_ENABLED
++static void NativeOptions_Save(void)
++{
++	if (s_nativeOptSaveHook != NULL)
++	{
++		s_nativeOptSaveHook();
++	}
++}
++
++static void NativeOptions_InitRows(void)
++{
++	static int done;
++	if (done)
++	{
++		return;
++	}
++	done = 1;
++	for (int i = 0; i < NATIVE_OPT_ROW_COUNT; i++)
++	{
++		struct MenuRow *row = &s_nativeOptRows[i];
++		row->stringIndex = (s16)(NATIVE_OPT_LNG_BASE + i);
++		row->rowOnPressUp = (char)(i > 0 ? i - 1 : 0);
++		row->rowOnPressDown = (char)(i < NATIVE_OPT_ROW_COUNT - 1 ? i + 1 : i);
++		row->rowOnPressLeft = (char)i; // left/right change the value
++		row->rowOnPressRight = (char)i;
++	}
++	s_nativeOptRows[NATIVE_OPT_ROW_COUNT].stringIndex = RECTMENU_STRING_NONE;
++
++
++}
++
++static void NativeOptions_SetLanguage(int lang)
++{
++	if ((lang < 0) || (lang >= NATIVE_OPT_LANG_COUNT))
++	{
++		return;
++	}
++	s_nativeOptLang = lang;
++	LOAD_LangFile(sdata->ptrBigfile1, s_nativeOptLangSlot[lang]); // reinstalls the labels
++	// The packaged voice sets are Spanish and English.
++	NativeAssets_SetXAVoiceLanguage(lang == 4 ? "SPN" : "ENG");
++	NativeOptions_InstallStrings();
++}
++
++// Change the value of an options row; dir is -1 or +1.
++static void NativeOptions_Change(int row, int dir)
++{
++	switch (row)
++	{
++	case NATIVE_OPT_ROW_SCREEN:
++		g_cfg_widescreen = !g_cfg_widescreen;
++		NativeRenderer_SetGameAspect(g_cfg_widescreen);
++		break;
++	case NATIVE_OPT_ROW_RESOLUTION:
++		s_nativeOptScale = ((s_nativeOptScale - 1 + dir + 4) % 4) + 1;
++		s_nativeOptScale = NativeRenderer_SetInternalResolutionScale(s_nativeOptScale);
++		break;
++	case NATIVE_OPT_ROW_FILTER:
++		g_cfg_bilinearFiltering = !g_cfg_bilinearFiltering;
++		break;
++	case NATIVE_OPT_ROW_VIBRATION:
++		s_nativeOptRumble = ((s_nativeOptRumble / 10 + dir + 11) % 11) * 10;
++		NativeOptions_ApplyRumble();
++#if defined(CTR_NATIVE_SWITCH2)
++		Switch2_PreviewRumble();
++#endif
++		break;
++	case NATIVE_OPT_ROW_UNLOCK:
++		g_cfg_unlockAll = !g_cfg_unlockAll;
++		break;
++	default:
++		return;
++	}
++	NativeOptions_InstallStrings();
++	NativeOptions_Save();
++}
++
++static void NativeOptions_OpenMenu(void)
++{
++	NativeOptions_InitRows();
++	NativeOptions_InstallStrings();
++	s_nativeOptMenu.state = RECTMENU_STATE_EXEC_CENTERED;
++	s_nativeOptMenu.rowSelected = 0;
++	s_nativeOptInputLock = 6;
++	s_nativeOptMenu.ptrNextBox_InHierarchy = NULL;
++	sdata->ptrDesiredMenu = &s_nativeOptMenu;
++}
++
++static void NativeOptions_OpenLanguage(struct RectMenu *back, int boot)
++{
++	s_nativeOptLangBack = back;
++	s_nativeOptBootPending = boot;
++	s_nativeOptBootTimer = 0;
++	s_nativeOptInputLock = 6;
++	NativeOptions_InitRows();
++	NativeOptions_InstallStrings();
++	g_palBootLanguageMenu.state = RECTMENU_STATE_EXEC_CENTERED | (boot ? MENU_CANT_GO_BACK : 0);
++	g_palBootLanguageMenu.rowSelected = (s16)s_nativeOptLang;
++	g_palBootLanguageMenu.ptrNextBox_InHierarchy = NULL;
++	sdata->ptrDesiredMenu = &g_palBootLanguageMenu;
++}
++
++static void NativeOptions_CloseLanguage(void)
++{
++	s_nativeOptBootPending = 0;
++	sdata->ptrDesiredMenu = (s_nativeOptLangBack != NULL) ? s_nativeOptLangBack : &D230.menuMainMenu;
++	if (s_nativeOptLangBack == &D230.menuMainMenu)
++	{
++		// boot select: leave the main menu cursor on the first row
++		D230.menuMainMenu.rowSelected = 0;
++	}
++}
++
++static void NativeOptions_MenuProc(struct RectMenu *menu)
++{
++	const s16 row = menu->rowSelected;
++
++	if (menu->funcState == RECTMENU_FUNC_STATE_UPDATE)
++	{
++		const u32 tap = sdata->buttonTapPerPlayer[0];
++		if (s_nativeOptInputLock > 0)
++		{
++			s_nativeOptInputLock--;
++		}
++		// left/right change the highlighted value in place
++		else if ((row >= 0) && (row != NATIVE_OPT_ROW_BACK) && ((tap & (BTN_LEFT | BTN_RIGHT)) != 0))
++		{
++			OtherFX_Play(0, 1);
++			NativeOptions_Change(row, (tap & BTN_LEFT) ? -1 : 1);
++		}
++		return;
++	}
++	if (menu->funcState != RECTMENU_FUNC_STATE_INPUT)
++	{
++		return;
++	}
++	if (s_nativeOptInputLock > 0)
++	{
++		return; // the tap that opened this menu is still held
++	}
++
++	if ((row < 0) || (row == NATIVE_OPT_ROW_BACK))
++	{
++		NativeOptions_Save();
++		sdata->ptrDesiredMenu = &D230.menuMainMenu;
++		return;
++	}
++	// Cross cycles the value (touch/one-button friendliness)
++	NativeOptions_Change(row, 1);
++}
++
++void NativeOptions_PalLanguageProc(struct RectMenu *menu)
++{
++	const s16 row = menu->rowSelected;
++
++	if (menu->funcState == RECTMENU_FUNC_STATE_UPDATE)
++	{
++		if (s_nativeOptInputLock > 0)
++		{
++			s_nativeOptInputLock--;
++		}
++		// PAL boot menu behaviour: keep the configured language after 30 s
++		if (s_nativeOptBootPending && (++s_nativeOptBootTimer >= NATIVE_OPT_BOOT_TIMEOUT))
++		{
++			NativeOptions_SetLanguage(row);
++			NativeOptions_Save();
++			NativeOptions_CloseLanguage();
++		}
++		return;
++	}
++	if (menu->funcState != RECTMENU_FUNC_STATE_INPUT)
++	{
++		return;
++	}
++	if (s_nativeOptInputLock > 0)
++	{
++		return; // the tap that opened this menu is still held
++	}
++
++	s_nativeOptBootPending = 0;
++	if ((row >= 0) && (row < NATIVE_OPT_LANG_COUNT))
++	{
++		NativeOptions_SetLanguage(row);
++		NativeOptions_Save();
++	}
++	else if ((menu->state & MENU_CANT_GO_BACK) != 0)
++	{
++		return; // boot select: a language must be chosen (or the timer runs out)
++	}
++	NativeOptions_CloseLanguage();
++}
++
++// Main menu rows plus OPTIONS at the end.
++static void NativeOptions_BuildMainRows(struct RectMenu *mainMenu)
++{
++	const struct MenuRow *src = mainMenu->rows;
++	int n = 0;
++
++	if (src == s_nativeOptMainRows)
++	{
++		return;
++	}
++	while ((src[n].stringIndex != RECTMENU_STRING_NONE) && (n < (int)len(s_nativeOptMainRows) - 2))
++	{
++		s_nativeOptMainRows[n] = src[n];
++		n++;
++	}
++	if (n == 0)
++	{
++		return;
++	}
++	s_nativeOptMainRows[n - 1].rowOnPressDown = (char)n;
++	s_nativeOptMainRows[n].stringIndex = LNG_OPTIONS;
++	s_nativeOptMainRows[n].rowOnPressUp = (char)(n - 1);
++	s_nativeOptMainRows[n].rowOnPressDown = (char)n;
++	s_nativeOptMainRows[n].rowOnPressLeft = (char)n;
++	s_nativeOptMainRows[n].rowOnPressRight = (char)n;
++	s_nativeOptMainRows[n + 1].stringIndex = RECTMENU_STRING_NONE;
++	mainMenu->rows = s_nativeOptMainRows;
++}
++#endif
++
++// Called at the top of MM_MenuProc_Main every frame.
++void NativeOptions_MainMenuUpdate(struct RectMenu *mainMenu)
++{
++#if NATIVE_OPTIONS_ENABLED
++	NativeOptions_InitRows();
++	if (!s_nativeOptConfigured)
++	{
++		// desktop: no ini, show what the renderer actually uses
++		s_nativeOptConfigured = 1;
++		s_nativeOptScale = s_internalResolutionScale;
++		NativeOptions_InstallStrings();
++	}
++	if ((sdata->lngStrings == NULL) || (sdata->lngStrings[NATIVE_OPT_LNG_BASE] == NULL))
++	{
++		NativeOptions_InstallStrings();
++	}
++	NativeOptions_BuildMainRows(mainMenu);
++
++	// PAL-style language select, once per boot, when the menu is first shown.
++	if (!s_nativeOptBootDone && (mainMenu->funcState == RECTMENU_FUNC_STATE_UPDATE) && (D230.titleMenuState == TITLE_MENU_STATE_IN_MENU) &&
++	    ((mainMenu->state & DRAW_NEXT_MENU_IN_HIERARCHY) == 0))
++	{
++		s_nativeOptBootDone = 1;
++		if (s_nativeOptAskLanguage)
++		{
++			NativeOptions_OpenLanguage(&D230.menuMainMenu, 1);
++		}
++	}
++#endif
++}
++
++// Called from MM_MenuProc_Main with the LNG index of the confirmed row.
++int NativeOptions_MainMenuChoose(struct RectMenu *mainMenu, s16 choose)
++{
++#if NATIVE_OPTIONS_ENABLED
++	(void)mainMenu;
++	if (choose == LNG_OPTIONS)
++	{
++		NativeOptions_OpenMenu();
++		return 1;
++	}
++#else
++	(void)mainMenu;
++	(void)choose;
++#endif
++	return 0;
++}
+diff --git a/platform/native_renderer.c b/platform/native_renderer.c
+index 4133b726..d48b9966 100644
+--- a/platform/native_renderer.c
++++ b/platform/native_renderer.c
+@@ -721,6 +721,13 @@ internal void NativeRenderer_UpdatePresentationViewport(void)
+ 	s_presentViewport.y = (g_windowHeight - viewportH) / 2;
+ }
+ 
++// Apply the menu's aspect choice to the actual output viewport immediately.
++void NativeRenderer_SetGameAspect(int widescreen)
++{
++	NativeRenderer_SetPresentationAspect(widescreen ? 16 : 4, widescreen ? 9 : 3);
++	NativeRenderer_UpdatePresentationViewport();
++}
++
+ internal void NativeRenderer_InitRenderTarget(struct NativeRenderTarget *target)
+ {
+ 	target->texture = (TextureID)-1;
+diff --git a/platform/switch2/README.md b/platform/switch2/README.md
+index e1c19888..56966c4b 100644
+--- a/platform/switch2/README.md
++++ b/platform/switch2/README.md
+@@ -49,7 +49,7 @@ sdmc:/switch/ctr-native/
+ ```
+ 
+ `ctr-native.ini`: `widescreen`, `internal_scale` (1-4), `bilinear`, `voices`
+-(ENG, SPN, ...), `unlock_all`, `capture_swaps` (diagnostic BMP captures).
++(ENG, SPN, ...), `unlock_all`, `rumble` (0-100, default 35), `capture_swaps` (diagnostic BMP captures).
+ 
+ `CTR_SWITCH2_CTR_WEB_ASSETS` (default ON) is for data converted from the PAL
+ disc by ctr-web: PAL VRAM layout (`CTR_SWAPCHAIN_Y=0xEC`), no XA music and no
+diff --git a/platform/switch2/sdl3_switch2.c b/platform/switch2/sdl3_switch2.c
+index 478ec39c..28bfa4d3 100644
+--- a/platform/switch2/sdl3_switch2.c
++++ b/platform/switch2/sdl3_switch2.c
+@@ -861,6 +861,16 @@ static bool s_vibrationReady[SWITCH2_MAX_PADS];
+ static bool s_vibrationActive[SWITCH2_MAX_PADS];
+ static Uint64 s_vibrationEndNS[SWITCH2_MAX_PADS];
+ static int s_vibrationLogCount;
++static Uint64 s_previewRumbleEndNS;
++// HD rumble at amplitude 1.0 is far stronger than a DualShock and makes the
++// actuators buzz audibly; ctr-native.ini "rumble" (0-100) scales it.
++static float s_rumbleStrength = 0.35f;
++
++void Switch2_SetRumbleStrength(int percent)
++{
++	percent = percent < 0 ? 0 : (percent > 100 ? 100 : percent);
++	s_rumbleStrength = (float)percent / 100.0f;
++}
+ 
+ static void Switch2_StopVibration(int index);
+ 
+@@ -1160,14 +1170,21 @@ bool SDL_RumbleGamepad(SDL_Gamepad *gamepad, Uint16 low_frequency_rumble, Uint16
+ {
+ 	const int index = gamepad ? Switch2_PadIndex(gamepad->id) : -1;
+ 	HidVibrationValue values[2];
+-	float low = (float)low_frequency_rumble / 65535.0f;
+-	float high = (float)high_frequency_rumble / 65535.0f;
++	// low = DualShock large motor (variable), high = small motor (on/off,
++	// and much weaker on the original pad, hence the extra 0.5).
++	float low = (float)low_frequency_rumble / 65535.0f * s_rumbleStrength;
++	float high = (float)high_frequency_rumble / 65535.0f * s_rumbleStrength * 0.5f;
++
++	// Retail sends its motor state every poll, often zero in menus. Keep the
++	// preview alive until its deadline instead of letting those polls cancel it.
++	if (index == 0 && SDL_GetTicksNS() < s_previewRumbleEndNS)
++		return true;
+ 
+ 	if ((index < 0) || !s_padConnected[index] || !Switch2_PrepareVibration(index))
+ 	{
+ 		return false;
+ 	}
+-	if ((low_frequency_rumble | high_frequency_rumble) == 0)
++	if (((low_frequency_rumble | high_frequency_rumble) == 0) || (s_rumbleStrength <= 0.0f))
+ 	{
+ 		Switch2_StopVibration(index);
+ 		return true;
+@@ -1197,6 +1214,21 @@ bool SDL_RumbleGamepad(SDL_Gamepad *gamepad, Uint16 low_frequency_rumble, Uint16
+ 	return true;
+ }
+ 
++void Switch2_PreviewRumble(void)
++{
++	// Clear any previous override before applying the new level (including 0).
++	s_previewRumbleEndNS = 0;
++	if (!s_padInitialized || !s_padConnected[0])
++		return;
++	if (s_rumbleStrength <= 0.0f)
++	{
++		Switch2_StopVibration(0);
++		return;
++	}
++	if (SDL_RumbleGamepad(&s_gamepads[0], 65535, 0, 250))
++		s_previewRumbleEndNS = SDL_GetTicksNS() + 250000000ull;
++}
++
+ int SDL_AddGamepadMappingsFromFile(const char *file)
+ {
+ 	(void)file;
+diff --git a/platform/switch2/switch2_platform.h b/platform/switch2/switch2_platform.h
+index 5ade571b..b93b6219 100644
+--- a/platform/switch2/switch2_platform.h
++++ b/platform/switch2/switch2_platform.h
+@@ -15,6 +15,10 @@ int CtrNative_Main(int argc, char *argv[]);
+ // the system to close the program. For errors before the renderer exists.
+ void Switch2_ShowFatalMessage(const char *title, const char *message);
+ 
++// Rumble strength 0-100 (ctr-native.ini "rumble", OPTIONS menu).
++void Switch2_SetRumbleStrength(int percent);
++void Switch2_PreviewRumble(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+
+-- 
+2.39.0

@@ -1,0 +1,28 @@
+From 93ebb9c2b96f52341153ff9433be5ebcaf207efa Mon Sep 17 00:00:00 2001
+From: aignis <6974796+aignis@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 11:39:11 +0100
+Subject: [PATCH] switch2: explicitly permit controller vibration
+
+---
+ platform/switch2/sdl3_switch2.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/platform/switch2/sdl3_switch2.c b/platform/switch2/sdl3_switch2.c
+index 1dfc8262..123787bd 100644
+--- a/platform/switch2/sdl3_switch2.c
++++ b/platform/switch2/sdl3_switch2.c
+@@ -871,6 +871,11 @@ static void Switch2_PadInit(void)
+ 	padInitialize(&s_pads[1], HidNpadIdType_No2);
+ 	padInitialize(&s_pads[2], HidNpadIdType_No3);
+ 	padInitialize(&s_pads[3], HidNpadIdType_No4);
++	// HID disables homebrew rumble until the process explicitly opts in.
++	if (R_FAILED(hidPermitVibration(true)))
++	{
++		fprintf(stderr, "[Switch2] hidPermitVibration failed\n");
++	}
+ 	for (int i = 0; i < SWITCH2_MAX_PADS; i++)
+ 	{
+ 		s_gamepads[i].id = (SDL_JoystickID)(i + 1);
+-- 
+2.49.0
+
