@@ -10,6 +10,39 @@ The base is [CTRPad](https://github.com/chrissotraidis/ctrpad) at commit `d57863
 
 The patch workflow makes the precise upstream base and local changes reviewable and keeps third-party source and game data out of this repository. CTRPad is GPL-3.0 licensed; see [LICENSE](LICENSE), the upstream repository, and its `RIGHTS_AND_LICENSES.md` for the project's licensing and attribution details. Game content and trademarks belong to their respective owners.
 
+## Added features
+
+CTR NX2 adds Switch 2 support and a small set of settings to the CTRPad base:
+
+- **Switch 2 platform layer:** graphics through EGL/OpenGL ES and OunceVK, audio through audren, controller input and an exit shortcut back to the homebrew menu.
+- **In-game Options:** choose 16:9 or 4:3, internal resolution from 1× to 4×, texture filtering, vibration strength and whether to unlock content. Values are saved between sessions. Changing vibration strength plays a brief preview on a connected controller.
+- **Optional multilingual text:** the PAL profile offers English, French, German, Italian, Spanish and Dutch at startup. Spanish text uses Spanish voices; the other languages use English voices. The NTSC-only profile uses English text and voices.
+- **Local data preparation:** choose an English-only setup from an NTSC-U disc, or add a PAL disc for multilingual text. The scripts extract data locally; game assets are not supplied by this repository.
+- **Diagnostics:** the app writes logs alongside the NRO and can optionally capture frames for troubleshooting.
+
+The following is a **text-only illustration**, created for this README. It describes the choices and does not reproduce the in-game appearance or assets. Values shown are examples:
+
+```text
+Settings overview                 Example
+-------------------------------------------
+Display format                    16:9
+Internal resolution               3×
+Texture filtering                 Off
+Controller vibration              4 / 10
+Unlock all content                Off
+Return to game
+```
+
+## Future improvements
+
+- **Local multiplayer:** develop, verify and polish the multi-controller and split-screen experience on Switch 2.
+- **Controller feedback:** test the Pro Controller and Joy-Con rumble independently and tune the feedback to reduce unwanted buzzing.
+- **Presentation:** refine widescreen and 4:3 UI proportions and test menus across languages.
+- **Hardware validation:** exercise language selection, save persistence, video playback and performance across more Switch 2 setups.
+- **Online multiplayer:** investigate whether a suitable networking implementation can be added; the browser version's online functionality is not currently included.
+
+These are goals, not promises or features already verified on every device.
+
 ## Choose a data profile
 
 | Profile | Discs required | Text | Voices | Build output |
